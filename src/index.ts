@@ -1,4 +1,4 @@
-// Library entry point. Requires bun (the store uses bun:sqlite).
+// Library entry point.
 
 export {
   ApiError,

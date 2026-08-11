@@ -2,16 +2,16 @@
 
 Incremental export of a Convex deployment's data using the [data sync API](https://docs.convex.dev/deployment-api/data-sync) (`POST /api/v1/data/sync`, beta).
 
-Runs on plain node (>= 24; uses the built-in `node:sqlite`). No bun required, though bun works too.
+Runs on plain node (>= 24; uses the built-in `node:sqlite`).
 
 Documents are mirrored into a local SQLite database. Each page from the API is applied in a single transaction together with its cursor, so the local copy is always resumable and never half-applied. Running `sync` again continues from the saved cursor and only pulls what changed.
 
 ## Setup
 
 ```sh
-bun install          # or npm install
-bun run build        # compiles src/ to dist/ (the bin entry)
-bun link             # makes the `datasync` command available globally
+npm install          # install dependencies
+npm run build        # compiles src/ to dist/ (the bin entry)
+npm link             # makes the `datasync` command available globally
 ```
 
 Credentials are resolved in order:
@@ -24,9 +24,9 @@ The sync database is named `<deployment-name>.sqlite3` (e.g. `happy-otter-123.sq
 ## Installing in another project
 
 ```sh
-npm install path/to/datasync   # bun add file:... also works
-# or once pushed to a git host:
-npm install git+https://github.com/<you>/datasync.git
+npm install git+https://github.com/graham/convex-datasync.git
+# or from a local checkout:
+npm install path/to/datasync
 ```
 
 This gives you the `datasync` CLI (run via `npx datasync ...`) and a library API:
@@ -139,9 +139,9 @@ Ctrl-c is always safe. Every page is applied to SQLite in one transaction togeth
 ## Development
 
 ```sh
-bun run test         # node --test
-bun run typecheck    # tsc --noEmit
-bun run build        # emit dist/
+npm run test         # node --test
+npm run typecheck    # tsc --noEmit
+npm run build        # emit dist/
 ```
 
 The source runs directly under node's native TypeScript support (`node src/cli.ts ...`); `dist/` is only needed for the installed bin and library entry points. `--keep-deleted` details: tombstones from the API carry only `_id`, so the row's `value` column keeps the last-synced document; `readTable(component, table, true)` includes tombstoned rows, and exports/dry-run counts cover live documents only.

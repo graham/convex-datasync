@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 const BIG_BRAIN_URL = "https://api.convex.dev/api/";
 
-// Node does not auto-load dotenv files the way bun does. Loads .env.local
+// Node does not auto-load dotenv files. Loads .env.local
 // then .env from the current directory; real environment variables win, and
 // .env.local wins over .env.
 export function loadEnvFiles(): void {
