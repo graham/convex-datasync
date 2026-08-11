@@ -1,0 +1,42 @@
+{
+  "name": "datasync",
+  "version": "0.1.0",
+  "description": "Incremental local mirror of a Convex deployment's data via the data sync API",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "datasync": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "sync": "node src/cli.ts sync",
+    "status": "node src/cli.ts status",
+    "export": "node src/cli.ts export",
+    "test": "node --test \"tests/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "cli-progress": "^3.12.0"
+  },
+  "devDependencies": {
+    "@types/cli-progress": "^3.11.6",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}

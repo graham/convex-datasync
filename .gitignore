@@ -1,0 +1,11 @@
+node_modules/
+dist/
+export/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.local
