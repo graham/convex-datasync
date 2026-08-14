@@ -85,9 +85,11 @@ datasync status
 # /data/list_active_syncs); the one this database follows is marked.
 datasync list
 
-# Dump synced tables to export/<component>/<table>.jsonl (or --format json).
+# Dump synced tables to export/<component>/<table>.jsonl.
 datasync export
 datasync export --out dump --format json
+datasync export --format csv
+datasync export --format parquet
 ```
 
 ## Commands
@@ -117,7 +119,18 @@ Lists the deployment's live data syncs via `/data/list_active_syncs` (anything t
 
 ### export
 
-Offline: dumps synced tables to `<out>/<componentPath>/<table>.<format>`. Flags: `--out <dir>` (default `export`), `--format jsonl|json` (default `jsonl`), plus `--db`/`--url`/`--deployment` as in `status` (same `--prod` restriction). Exports live documents only; tombstoned rows kept by `--keep-deleted` are excluded.
+Offline: dumps synced tables to `<out>/<componentPath>/<table>.<format>`. Flags: `--out <dir>` (default `export`), `--format jsonl|json|csv|parquet` (default `jsonl`), plus `--db`/`--url`/`--deployment` as in `status` (same `--prod` restriction). Exports live documents only; tombstoned rows kept by `--keep-deleted` are excluded.
+
+#### Tabular formats (csv, parquet)
+
+`jsonl` and `json` write documents as they came from the deployment. `csv` and `parquet` are tabular, and Convex documents are schemaless, so a table's columns are derived from its contents:
+
+- The column set is the union of every top-level key in the table — `_id` and `_creationTime` first, then the rest alphabetically. A document missing a key gets an empty/null cell.
+- Each column gets one type: `boolean`, `number` (parquet `DOUBLE`; Convex numbers are IEEE-754 doubles) or `string`. Nested objects and arrays, and columns whose type varies between documents, are serialized as JSON text (parquet's `JSON` logical type, which readers like DuckDB expose as a JSON column).
+- CSV follows RFC 4180 with a header row and LF line endings. As in Postgres `COPY ... CSV`, a null (or a missing key) is a bare empty field while an empty string is written as `""`, so the two stay distinguishable.
+- Parquet is written by [hyparquet-writer](https://github.com/hyparam/hyparquet-writer) — pure JS, no native dependencies — with the default SNAPPY compression.
+
+Both formats build a table's rows in memory before writing, so a very large table costs roughly its JSON size in RAM.
 
 ## Output
 

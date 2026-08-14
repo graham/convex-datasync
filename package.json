@@ -32,11 +32,13 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "cli-progress": "^3.12.0"
+    "cli-progress": "^3.12.0",
+    "hyparquet-writer": "^0.16.6"
   },
   "devDependencies": {
     "@types/cli-progress": "^3.11.6",
     "@types/node": "^24.0.0",
+    "hyparquet": "^1.28.2",
     "typescript": "^5.7.0"
   }
 }

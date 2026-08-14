@@ -3,7 +3,7 @@ import { existsSync, renameSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { DataSyncClient } from "./api.ts";
 import { loadEnvFiles, localDeploymentName, resolveConnection } from "./config.ts";
-import { runExport } from "./export.ts";
+import { EXPORT_FORMATS, isExportFormat, runExport } from "./export.ts";
 import { parseTableFilter, selectionFromFilter, tableMatches } from "./filter.ts";
 import { runDryRun } from "./inspect.ts";
 import { Store } from "./store.ts";
@@ -44,7 +44,7 @@ Options:
   --max-pages <n>      stop after n pages (progress saved; rerun to continue)
   --debug              log every page including empty ones, with cursor fingerprints
   --out <dir>          export output directory (default: export)
-  --format <fmt>       export format: jsonl or json (default: jsonl)
+  --format <fmt>       export format: jsonl, json, csv or parquet (default: jsonl)
   --help               show this help
 `;
 
@@ -144,8 +144,8 @@ async function main(): Promise<void> {
 
   if (command === "export") {
     const format = values.format as string;
-    if (format !== "jsonl" && format !== "json") {
-      fail(`unknown format: ${format} (expected jsonl or json)`);
+    if (!isExportFormat(format)) {
+      fail(`unknown format: ${format} (expected ${EXPORT_FORMATS.join(", ")})`);
     }
     const store = new Store(offlineDbPath());
     try {

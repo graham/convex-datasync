@@ -1,10 +1,20 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { toCsv } from "./csv.ts";
+import { writeParquetFile } from "./parquet.ts";
 import type { Store } from "./store.ts";
+
+export const EXPORT_FORMATS = ["jsonl", "json", "csv", "parquet"] as const;
+
+export type ExportFormat = (typeof EXPORT_FORMATS)[number];
+
+export function isExportFormat(value: string): value is ExportFormat {
+  return (EXPORT_FORMATS as readonly string[]).includes(value);
+}
 
 export interface ExportOptions {
   outDir: string;
-  format: "jsonl" | "json";
+  format: ExportFormat;
 }
 
 // Writes each synced table to <outDir>/<componentPath>/<table>.<format>.
@@ -22,17 +32,19 @@ export async function runExport(store: Store, options: ExportOptions): Promise<v
     mkdirSync(dir, { recursive: true });
     const path = join(dir, `${stat.table}.${options.format}`);
     const docs = store.readTable(stat.component, stat.table);
-    let content: string;
-    if (options.format === "json") {
-      content = JSON.stringify([...docs], null, 2) + "\n";
+    if (options.format === "parquet") {
+      writeParquetFile(path, docs);
+    } else if (options.format === "csv") {
+      writeFileSync(path, toCsv(docs));
+    } else if (options.format === "json") {
+      writeFileSync(path, JSON.stringify([...docs], null, 2) + "\n");
     } else {
       let lines = "";
       for (const doc of docs) {
         lines += JSON.stringify(doc) + "\n";
       }
-      content = lines;
+      writeFileSync(path, lines);
     }
-    writeFileSync(path, content);
     console.log(`${path}: ${stat.documents} document(s)`);
   }
 }
