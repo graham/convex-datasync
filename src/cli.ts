@@ -3,16 +3,19 @@ import { existsSync, renameSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { DataSyncClient } from "./api.ts";
 import { loadEnvFiles, localDeploymentName, resolveConnection } from "./config.ts";
+import type { DataStore } from "./datastore.ts";
+import { DeltaLogStore } from "./deltalog.ts";
 import { EXPORT_FORMATS, isExportFormat, runExport } from "./export.ts";
 import { parseTableFilter, selectionFromFilter, tableMatches } from "./filter.ts";
 import { runDryRun } from "./inspect.ts";
-import { Store } from "./store.ts";
+import { Store, type StoreOptions } from "./store.ts";
 import { runSync, selectionForTables } from "./sync.ts";
 
 const USAGE = `datasync - incremental Convex deployment data sync
 
 Usage:
-  datasync sync [options]     fetch pages until caught up (resumes from saved cursor)
+  datasync sync [options]     fetch pages until caught up (resumes from saved cursor),
+                                writing sqlite plus --format files if given
   datasync dry-run [options]  compare server vs local document counts, download nothing
   datasync status             show local sync state and per-table counts
   datasync list               list live data syncs on the deployment
@@ -31,7 +34,11 @@ Options:
   --deploy-key <key>   deploy key (default: env CONVEX_DEPLOY_KEY)
   --prod               target the current project's prod deployment
   --deployment <name>  target a specific deployment by name (bare or prefixed)
+  --store <kind>       where synced data lives: sqlite (default) or log, an
+                       append-only log of parquet deltas plus cursor.json
   --db <path>          sqlite database path (default: <deployment-name>.sqlite3)
+  --log-dir <dir>      delta log directory for --store log
+                       (default: <deployment-name>.deltalog)
   --tables <a,b,c>     only sync these root-component tables (default: everything)
   --include-tables <re>  only sync root tables whose name matches this regex
   --exclude-tables <re>  skip root tables whose name matches this regex
@@ -39,12 +46,17 @@ Options:
   --keep-deleted       keep rows for deleted documents (marked with a deleted
                        flag, last-synced value preserved) instead of removing them
   --fresh              discard local data and cursor, restart sync from scratch
+  --fresh-export       rewrite every --format file, including tables this run
+                       did not change (once per run, not once per watch poll)
   --watch              keep polling for new writes instead of exiting when caught up
   --interval <secs>    poll interval in watch mode after catching up (default: 60)
   --max-pages <n>      stop after n pages (progress saved; rerun to continue)
   --debug              log every page including empty ones, with cursor fingerprints
   --out <dir>          export output directory (default: export)
-  --format <fmt>       export format: jsonl, json, csv or parquet (default: jsonl)
+  --format <fmt>       output format: jsonl, json, csv or parquet. On export it
+                       picks the dump format (default: jsonl). On sync it also
+                       keeps files in that format up to date next to the
+                       sqlite mirror; without it sync writes sqlite only.
   --help               show this help
 `;
 
@@ -64,16 +76,19 @@ async function main(): Promise<void> {
       prod: { type: "boolean", default: false },
       deployment: { type: "string" },
       db: { type: "string" },
+      store: { type: "string", default: "sqlite" },
+      "log-dir": { type: "string" },
       tables: { type: "string" },
       "include-tables": { type: "string" },
       "exclude-tables": { type: "string" },
       "ignore-tables": { type: "string" },
       "keep-deleted": { type: "boolean", default: false },
       fresh: { type: "boolean", default: false },
+      "fresh-export": { type: "boolean", default: false },
       watch: { type: "boolean", default: false },
       interval: { type: "string", default: "60" },
       out: { type: "string", default: "export" },
-      format: { type: "string", default: "jsonl" },
+      format: { type: "string" },
       "max-pages": { type: "string" },
       debug: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
@@ -84,6 +99,39 @@ async function main(): Promise<void> {
   if (values.help || command === "help") {
     console.log(USAGE);
     return;
+  }
+
+  // --format is optional everywhere: export falls back to jsonl, sync writes
+  // no files at all unless it is given.
+  const requestedFormat = values.format as string | undefined;
+  if (requestedFormat !== undefined && !isExportFormat(requestedFormat)) {
+    fail(`unknown format: ${requestedFormat} (expected ${EXPORT_FORMATS.join(", ")})`);
+  }
+  if (requestedFormat !== undefined && !["sync", "export"].includes(command)) {
+    fail(`--format has no effect on ${command}; it applies to sync and export`);
+  }
+  const freshExport = values["fresh-export"] as boolean;
+  if (freshExport && command !== "sync") {
+    // export always rewrites every table anyway, so the flag would be a no-op.
+    fail(
+      command === "export"
+        ? "--fresh-export has no effect on export; it already rewrites every table"
+        : `--fresh-export has no effect on ${command}; it applies to sync`,
+    );
+  }
+  if (freshExport && requestedFormat === undefined) {
+    fail("--fresh-export needs --format <fmt>; without it sync writes no files to refresh");
+  }
+
+  const storeKind = values.store as string;
+  if (storeKind !== "sqlite" && storeKind !== "log") {
+    fail(`unknown store: ${storeKind} (expected sqlite or log)`);
+  }
+  if (storeKind === "log" && values.db !== undefined) {
+    fail("--db is for --store sqlite; --store log uses --log-dir");
+  }
+  if (storeKind === "sqlite" && values["log-dir"] !== undefined) {
+    fail("--log-dir is for --store log; --store sqlite uses --db");
   }
 
   // Default db name: <deployment-name>.sqlite3 (first label of the
@@ -105,23 +153,35 @@ async function main(): Promise<void> {
     return dbPath;
   };
 
+  const logDirFor = (deploymentName: string | null): string =>
+    (values["log-dir"] as string | undefined) ?? `${deploymentName ?? "datasync"}.deltalog`;
+
+  // Where this deployment's data lives, in whichever backend is selected.
+  const storePathFor = (deploymentName: string | null): string =>
+    storeKind === "log" ? logDirFor(deploymentName) : dbPathFor(deploymentName);
+
+  const openStore = (deploymentName: string | null, options: StoreOptions = {}): DataStore =>
+    storeKind === "log"
+      ? new DeltaLogStore(logDirFor(deploymentName), options)
+      : new Store(dbPathFor(deploymentName), options);
+
   // status/export are offline; the prod deployment's name is only known
   // after a network call, so require an explicit target for them.
-  const offlineDbPath = (): string => {
-    if (values.prod && values.db === undefined) {
-      fail("--prod with status/export needs --db <path> or --deployment <name>");
+  const offlineDeployment = (): string | null => {
+    const explicit = storeKind === "log" ? values["log-dir"] : values.db;
+    if (values.prod && explicit === undefined) {
+      fail(
+        `--prod with status/export needs ${storeKind === "log" ? "--log-dir <dir>" : "--db <path>"} or --deployment <name>`,
+      );
     }
-    return dbPathFor(
-      localDeploymentName({
-        url: values.url as string | undefined,
-        deployment: values.deployment as string | undefined,
-      }),
-    );
+    return localDeploymentName({
+      url: values.url as string | undefined,
+      deployment: values.deployment as string | undefined,
+    });
   };
 
   if (command === "status") {
-    const dbPath = offlineDbPath();
-    const store = new Store(dbPath);
+    const store = openStore(offlineDeployment());
     try {
       const state = store.getState();
       if (state.syncId === null) {
@@ -132,7 +192,7 @@ async function main(): Promise<void> {
       console.log(`status:    ${state.statusType}`);
       console.log(`syncedTs:  ${state.syncedTs ?? "n/a"}`);
       console.log(`updated:   ${state.updatedAt ? new Date(state.updatedAt).toISOString() : "n/a"}`);
-      for (const stat of store.tableStats()) {
+      for (const stat of await store.tableStats()) {
         const deleted = stat.deletedDocuments > 0 ? ` (+${stat.deletedDocuments} deleted)` : "";
         console.log(`${stat.component || "<root>"}/${stat.table}: ${stat.documents}${deleted}`);
       }
@@ -143,13 +203,12 @@ async function main(): Promise<void> {
   }
 
   if (command === "export") {
-    const format = values.format as string;
-    if (!isExportFormat(format)) {
-      fail(`unknown format: ${format} (expected ${EXPORT_FORMATS.join(", ")})`);
-    }
-    const store = new Store(offlineDbPath());
+    const store = openStore(offlineDeployment());
     try {
-      await runExport(store, { outDir: values.out as string, format });
+      await runExport(store, {
+        outDir: values.out as string,
+        format: requestedFormat ?? "jsonl",
+      });
     } finally {
       store.close();
     }
@@ -172,9 +231,8 @@ async function main(): Promise<void> {
     }
     // Mark the sync this machine's database is following, if any.
     let localSyncId: string | null = null;
-    const dbPath = dbPathFor(connection.deploymentName);
-    if (existsSync(dbPath)) {
-      const store = new Store(dbPath);
+    if (existsSync(storePathFor(connection.deploymentName))) {
+      const store = openStore(connection.deploymentName);
       try {
         localSyncId = store.getState().syncId;
       } finally {
@@ -212,7 +270,7 @@ async function main(): Promise<void> {
   }
 
   if (command === "dry-run") {
-    const store = new Store(dbPathFor(connection.deploymentName));
+    const store = openStore(connection.deploymentName);
     try {
       await runDryRun(client, store, filter);
     } finally {
@@ -258,7 +316,7 @@ async function main(): Promise<void> {
     selection = selectionFromFilter(rootTables, filter);
   }
 
-  const store = new Store(dbPathFor(connection.deploymentName), {
+  const store = openStore(connection.deploymentName, {
     keepDeleted: values["keep-deleted"] as boolean,
   });
   try {
@@ -272,6 +330,10 @@ async function main(): Promise<void> {
       selection,
       maxPages,
       debug: values.debug as boolean,
+      exportTo:
+        requestedFormat === undefined
+          ? undefined
+          : { outDir: values.out as string, format: requestedFormat, fresh: freshExport },
     });
   } finally {
     store.close();

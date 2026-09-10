@@ -32,17 +32,19 @@ npm install path/to/datasync
 This gives you the `datasync` CLI (run via `npx datasync ...`) and a library API:
 
 ```ts
-import { DataSyncClient, Store, runSync, resolveConnection } from "datasync";
+import { DataSyncClient, Store, DeltaLogStore, runSync, resolveConnection } from "datasync";
 
 const connection = await resolveConnection({});          // same credential rules as the CLI
 const client = new DataSyncClient(connection.url, connection.deployKey);
 const store = new Store(`${connection.deploymentName}.sqlite3`);
 await runSync(client, store, { watch: false, intervalSeconds: 60 });
-for (const doc of store.readTable("", "users")) {
+for await (const doc of store.readTable("", "users")) {
   console.log(doc._id, doc);
 }
 store.close();
 ```
+
+`Store` (sqlite) and `DeltaLogStore` (parquet deltas) both implement the `DataStore` interface that `runSync`, `runExport` and `runDryRun` take, so they are interchangeable. Reads are async on both: `tableStats()` returns a promise and `readTable()` is an async iterable, since the parquet backend has to decode files to answer them.
 
 The published entry points are compiled JS in `dist/` (built by the `prepare` script on install), so consumers just need node >= 24. To publish to the npm registry, remove `"private": true` and run `npm publish`.
 
@@ -90,6 +92,14 @@ datasync export
 datasync export --out dump --format json
 datasync export --format csv
 datasync export --format parquet
+
+# Keep parquet (or csv/json/jsonl) files up to date as part of every sync,
+# alongside the sqlite mirror. Without --format, sync writes sqlite only.
+datasync sync --format parquet
+datasync sync --format csv --out dump --watch
+
+# Rewrite every file, including tables this run did not change.
+datasync sync --format parquet --fresh-export
 ```
 
 ## Commands
@@ -101,9 +111,10 @@ Running `datasync` with no command runs `sync`. `datasync help` (or `--help`) pr
 Fetches pages from `/data/sync` until the deployment reports the sync is caught up, applying each page atomically with its cursor. Rerunning resumes incrementally.
 
 - Connection: `--url <url>`, `--deploy-key <key>` (default from env), `--prod` (the current project's prod deployment), `--deployment <name>` (any deployment, bare or `prod:`-prefixed). `--prod`/`--deployment` take precedence over env credentials and require an `npx convex login` session.
-- Storage: `--db <path>` (default `<deployment-name>.sqlite3`).
+- Storage: `--store sqlite` (default) with `--db <path>` (default `<deployment-name>.sqlite3`), or `--store log` with `--log-dir <dir>` (default `<deployment-name>.deltalog`); see [Parquet all the way down](#parquet-all-the-way-down---store-log).
 - Table selection: `--tables <a,b,c>` (exact list), or `--include-tables <regex>` / `--exclude-tables <regex>` (`--ignore-tables` is an alias for exclude). The exact list cannot be combined with the regex flags. Filters apply to root-component tables.
-- Behavior: `--keep-deleted` (mark deletions instead of removing rows), `--fresh` (discard local data and cursor first), `--watch` (keep polling after catching up), `--interval <secs>` (watch poll interval, default 60), `--max-pages <n>` (stop after n pages; progress is saved, rerun to continue), `--debug` (log every page, including empty ones, with cursor fingerprints).
+- Output: `--format jsonl|json|csv|parquet` plus `--out <dir>` (default `export`) to also keep files in that format up to date; see [Syncing straight to files](#syncing-straight-to-files). Omit `--format` and sync writes only the sqlite mirror.
+- Behavior: `--keep-deleted` (mark deletions instead of removing rows), `--fresh` (discard local data and cursor first), `--fresh-export` (rewrite every `--format` file, changed or not), `--watch` (keep polling after catching up), `--interval <secs>` (watch poll interval, default 60), `--max-pages <n>` (stop after n pages; progress is saved, rerun to continue), `--debug` (log every page, including empty ones, with cursor fingerprints).
 
 ### dry-run
 
@@ -111,7 +122,7 @@ Compares server per-table document counts against the local copy and reports whi
 
 ### status
 
-Offline: prints the saved syncId, status, consistency timestamp, and per-table counts (with deleted counts when `--keep-deleted` was used) from the local database. Accepts `--db`, `--url`, `--deployment` for locating the database. `--prod` alone is rejected here (the prod deployment's name — and so its db file — requires a network call): pass `--deployment <name>` or `--db`.
+Offline: prints the saved syncId, status, consistency timestamp, and per-table counts (with deleted counts when `--keep-deleted` was used) from the local copy. Accepts `--store`/`--db`/`--log-dir`, `--url`, `--deployment` for locating it. `--prod` alone is rejected here (the prod deployment's name — and so its db file — requires a network call): pass `--deployment <name>` or `--db`.
 
 ### list (alias: active-syncs)
 
@@ -131,6 +142,88 @@ Offline: dumps synced tables to `<out>/<componentPath>/<table>.<format>`. Flags:
 - Parquet is written by [hyparquet-writer](https://github.com/hyparam/hyparquet-writer) — pure JS, no native dependencies — with the default SNAPPY compression.
 
 Both formats build a table's rows in memory before writing, so a very large table costs roughly its JSON size in RAM.
+
+## Syncing straight to files
+
+`sync --format <fmt>` keeps files in that format up to date as part of the sync, so you do not have to remember a separate `export` run:
+
+```sh
+datasync sync --format parquet              # sqlite mirror + export/<table>.parquet
+datasync sync --format csv --out dump --watch
+```
+
+SQLite is still written, and still the source of truth: it holds the cursor that makes the sync incremental, and the tombstones that `--keep-deleted` preserves. The csv/parquet files are derived from it.
+
+- Files are rewritten whole from sqlite, never patched, so each one always holds a consistent snapshot of its table — deletions and truncations disappear from it as they should.
+- Only tables that changed during the run are rewritten, plus any whose file is missing (first run, or you deleted the output). A sync that pulls nothing new touches no files. With `--watch`, files are refreshed after every poll that applied changes.
+- A run cut short by ctrl-c or `--max-pages` writes what it applied before exiting. If the process is killed outright (`kill -9`) mid-run, the record of which tables changed dies with it, so a file can be left stale until that table next changes — `--fresh-export` (below) or a plain `datasync export --format <fmt>` rewrites everything and fixes it.
+
+### Forcing a rewrite
+
+`sync --fresh-export` ignores the change tracking and rewrites the file for every synced table, whether or not this run touched it:
+
+```sh
+datasync sync --format parquet --fresh-export
+```
+
+It needs `--format` (there is nothing to refresh otherwise) and applies to `sync` only — `export` already rewrites every table on every run, so `datasync export --format parquet` is the other way to get the same result without syncing.
+
+Under `--watch` it forces the run's first write only; later polls go back to writing just what changed, so watching does not mean rewriting the whole export every minute. Nothing is deleted: files for tables that are no longer synced, or left over from a different `--format`, stay where they are.
+
+Note this is not `--fresh`, which throws away the local data and cursor and re-downloads the deployment from scratch. `--fresh-export` re-derives files from the sqlite mirror you already have and never touches the network.
+
+## Parquet all the way down (`--store log`)
+
+Everything above keeps sqlite as the mirror and writes files from it. `--store log` drops sqlite entirely: the sync state goes in a small `cursor.json` and the data becomes an append-only log of parquet deltas.
+
+```sh
+datasync sync --store log                        # -> <deployment-name>.deltalog/
+datasync sync --store log --log-dir data/ --watch
+datasync status --store log --log-dir data/
+datasync export --store log --log-dir data/ --format csv
+```
+
+```
+data/
+  cursor.json                        cursor, syncId, status, high-water _seq
+  fold.sql                           the query below, ready to run
+  _root/games/000000000001.parquet   root component tables
+  _root/games/000000000004.parquet
+  waitlist/users/000000000009.parquet   component tables, under their path
+```
+
+Every page of changes becomes **new** files. Nothing already written is ever reopened, which is what makes this cheap: applying one changed document to a 110k-row table costs **0.7ms**, against 3ms for sqlite and 7.6s for the read-modify-write you would need to keep a single parquet file per table current.
+
+It also avoids a correctness trap. Parquet has null but no "absent", so a document read back out of a merged parquet file acquires a null for every column any of its table-mates ever had, and the drift compounds every cycle. A delta only ever carries the columns its own documents had, and is never rewritten, so the log stays faithful to what the deployment actually sent.
+
+Each row carries two reserved fields — `_seq`, increasing across the whole log, and `_op` (`u` upsert, `d` delete, `t` truncate). Convex reserves the underscore prefix for system fields, so these cannot collide with your data; a document that somehow carries one is rejected rather than silently mangled.
+
+### Reading the log
+
+Replay the deltas in `_seq` order. `fold.sql` in the log directory holds this, with `<table>` to substitute:
+
+```sql
+select * exclude (_op, _seq, rn) from (
+  select *, row_number() over (partition by _id order by _seq desc) rn
+  from read_parquet('<table>/*.parquet', union_by_name = true)
+  where _seq > coalesce(
+    (select max(_seq) from read_parquet('<table>/*.parquet', union_by_name = true) where _op = 't'),
+    -1)
+) where rn = 1 and _op <> 'd';
+```
+
+`union_by_name = true` is load-bearing: deltas deliberately have different column sets. The `_op = 't'` clause discards everything up to the last truncate — truncates are written with a lower `_seq` than the values in their own page, so a table truncated and refilled in one page folds correctly.
+
+`status`, `export` and `dry-run` do this fold internally, so they work the same as with sqlite. Folding 3,001 delta files into 110k live documents takes ~1.2s in-process, or ~244ms in DuckDB.
+
+### Trade-offs
+
+- **The log only grows.** There is no compaction yet, so a long-running `--watch` accumulates files. 3,001 files still fold in well under a second, so there is room, but this is the thing to watch. `datasync export --store log --format parquet` folds the log into ordinary flat files whenever you want a compacted copy.
+- **Reads cost a fold.** `status` on the log is ~1.2s where sqlite is instant, because counting live documents means replaying the log.
+- **Consumers must fold.** A delta file on its own is not the table — `games/000000000004.parquet` holds a page of changes, not the current data. Point tools at `fold.sql`, not at individual files.
+- **sqlite remains the default** and is still the better choice if you want a queryable local mirror or the fastest possible reads.
+
+`--format` is rejected on the commands it would not affect (`status`, `list`, `dry-run`) rather than being silently ignored.
 
 ## Output
 

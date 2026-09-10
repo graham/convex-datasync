@@ -15,21 +15,28 @@ export {
 export { resolveConnection, type Connection, type ConnectionFlags } from "./config.ts";
 export { toCsv } from "./csv.ts";
 export {
-  EXPORT_FORMATS,
-  isExportFormat,
-  runExport,
-  type ExportFormat,
-  type ExportOptions,
-} from "./export.ts";
-export { writeParquetFile } from "./parquet.ts";
-export { columnValue, deriveColumns, type Column, type ColumnType } from "./tabular.ts";
-export { parseTableFilter, selectionFromFilter, tableMatches, type TableFilter } from "./filter.ts";
-export { runDryRun } from "./inspect.ts";
-export {
-  Store,
+  collect,
+  type DataStore,
   type PageStats,
   type StoreOptions,
   type SyncState,
+  type TableChange,
   type TableStat,
-} from "./store.ts";
+} from "./datastore.ts";
+export { DeltaLogStore, foldQuery } from "./deltalog.ts";
+export {
+  EXPORT_FORMATS,
+  exportPath,
+  isExportFormat,
+  runExport,
+  tableKey,
+  type ExportFormat,
+  type ExportOptions,
+  type TableRef,
+} from "./export.ts";
+export { parseTableFilter, selectionFromFilter, tableMatches, type TableFilter } from "./filter.ts";
+export { runDryRun } from "./inspect.ts";
+export { writeParquetFile } from "./parquet.ts";
+export { Store } from "./store.ts";
 export { runSync, selectionForTables, type SyncOptions } from "./sync.ts";
+export { columnValue, deriveColumns, type Column, type ColumnType } from "./tabular.ts";

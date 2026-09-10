@@ -4,13 +4,13 @@
 
 import type { DataSyncClient } from "./api.ts";
 import { tableMatches, type TableFilter } from "./filter.ts";
-import type { Store } from "./store.ts";
+import type { DataStore } from "./datastore.ts";
 
 const COUNT_CONCURRENCY = 8;
 
 export async function runDryRun(
   client: DataSyncClient,
-  store: Store,
+  store: DataStore,
   filter: TableFilter | null,
 ): Promise<void> {
   console.log("dry run: comparing server document counts to the local copy\n");
@@ -28,7 +28,7 @@ export async function runDryRun(
 
   const local = new Map<string, number>();
   const localComponents: { component: string; table: string; documents: number }[] = [];
-  for (const stat of store.tableStats()) {
+  for (const stat of await store.tableStats()) {
     if (stat.component === "") {
       local.set(stat.table, stat.documents);
     } else {

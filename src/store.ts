@@ -4,47 +4,25 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { consistentTs, type DataSyncResponse } from "./api.ts";
+import type {
+  DataStore,
+  PageStats,
+  StoreOptions,
+  SyncState,
+  TableChange,
+  TableStat,
+} from "./datastore.ts";
 
-// syncedTs is kept as a string: Convex timestamps are int64 nanoseconds,
-// which exceed Number.MAX_SAFE_INTEGER (node:sqlite refuses to read such
-// values as numbers).
-export interface SyncState {
-  cursor: string | null;
-  syncId: string | null;
-  syncedTs: string | null;
-  statusType: string | null;
-  updatedAt: number | null;
-}
+export type {
+  DataStore,
+  PageStats,
+  StoreOptions,
+  SyncState,
+  TableChange,
+  TableStat,
+} from "./datastore.ts";
 
-export interface TableStat {
-  component: string;
-  table: string;
-  documents: number;
-  deletedDocuments: number;
-}
-
-export interface StoreOptions {
-  // Keep rows for deleted documents, marking them with a `deleted` flag and
-  // preserving their last-synced value, instead of removing them. Tombstones
-  // from the API carry only `_id`, so the stored value is left untouched.
-  keepDeleted?: boolean;
-}
-
-export interface TableChange {
-  component: string;
-  table: string;
-  upserted: number;
-  deleted: number;
-}
-
-export interface PageStats {
-  truncated: { component: string; table: string }[];
-  upserted: number;
-  deleted: number;
-  perTable: TableChange[];
-}
-
-export class Store {
+export class Store implements DataStore {
   private readonly db: DatabaseSync;
   private readonly keepDeleted: boolean;
 
@@ -207,7 +185,7 @@ export class Store {
     });
   }
 
-  tableStats(): TableStat[] {
+  async tableStats(): Promise<TableStat[]> {
     return this.db
       .prepare(
         `SELECT component, tbl AS "table",
@@ -220,11 +198,11 @@ export class Store {
 
   // Yields live documents; pass includeDeleted to also get tombstoned rows
   // (their last-synced value, with only `_id` for never-synced tombstones).
-  *readTable(
+  async *readTable(
     component: string,
     table: string,
     includeDeleted = false,
-  ): Generator<Record<string, unknown>> {
+  ): AsyncGenerator<Record<string, unknown>> {
     const rows = this.db
       .prepare(
         `SELECT value FROM documents

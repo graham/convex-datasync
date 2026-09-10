@@ -1,6 +1,14 @@
+import { existsSync } from "node:fs";
 import cliProgress from "cli-progress";
 import { ApiError, DataSyncClient, isCaughtUp, type Selection } from "./api.ts";
-import type { PageStats, Store } from "./store.ts";
+import type { DataStore, PageStats } from "./datastore.ts";
+import {
+  exportPath,
+  runExport,
+  tableKey,
+  type ExportFormat,
+  type TableRef,
+} from "./export.ts";
 
 export interface SyncOptions {
   watch: boolean;
@@ -10,6 +18,14 @@ export interface SyncOptions {
   maxPages?: number;
   // Log every page including empty ones, with cursor fingerprints.
   debug?: boolean;
+  // Mirror the synced data into flat files as well. The store stays the source
+  // of truth - it holds the cursor that makes the sync incremental - and these
+  // files are rewritten from it whenever their table changes.
+  //
+  // fresh forces the run's first write to cover every table, changed or not.
+  // Later writes in a --watch run go back to changed tables only, so watching
+  // does not mean rewriting the whole export on every poll.
+  exportTo?: { outDir: string; format: ExportFormat; fresh?: boolean };
 }
 
 // Short printable identity for an opaque cursor, to see whether it advances.
@@ -86,7 +102,7 @@ function interruptibleSleep(ms: number, signal: AbortSignal): Promise<void> {
 
 export async function runSync(
   client: DataSyncClient,
-  store: Store,
+  store: DataStore,
   options: SyncOptions,
 ): Promise<void> {
   let cursor = store.getState().cursor;
@@ -104,8 +120,9 @@ export async function runSync(
       })
     : null;
   const bar = multibar ? multibar.create(0, 0, { page: 0, detail: "starting" }) : null;
+  let barStopped = false;
   const log = (line: string) => {
-    if (multibar) {
+    if (multibar && !barStopped) {
       multibar.log(line + "\n");
     } else {
       console.log(line);
@@ -167,6 +184,51 @@ export async function runSync(
     }
   };
 
+  // Tables touched since the last time the export files were written.
+  const changedTables = new Map<string, TableRef>();
+  const noteChanged = (ref: TableRef) => {
+    if (options.exportTo) {
+      changedTables.set(tableKey(ref), { component: ref.component, table: ref.table });
+    }
+  };
+
+  // Rewrites the export files for tables that changed since the last write,
+  // plus any whose file is missing (first run, or the output was deleted).
+  // Each file is written whole from the store, so it always holds a consistent
+  // snapshot of the table rather than a patched-up one.
+  let freshExportPending = options.exportTo?.fresh === true;
+  const writeExport = async (): Promise<void> => {
+    const target = options.exportTo;
+    if (!target) {
+      return;
+    }
+    // Changed tables come from the pages themselves rather than from
+    // tableStats(), which no longer lists a table that a truncate or a run of
+    // deletions emptied - exactly the case whose file must not keep old rows.
+    const tables = new Map(changedTables);
+    for (const stat of await store.tableStats()) {
+      const key = tableKey(stat);
+      if (tables.has(key)) {
+        continue;
+      }
+      if (freshExportPending || !existsSync(exportPath(target.outDir, target.format, stat))) {
+        tables.set(key, { component: stat.component, table: stat.table });
+      }
+    }
+    changedTables.clear();
+    freshExportPending = false;
+    if (tables.size === 0) {
+      return;
+    }
+    flushEmptyStreak();
+    await runExport(store, {
+      outDir: target.outDir,
+      format: target.format,
+      tables: [...tables.values()],
+      log,
+    });
+  };
+
   try {
     while (!interrupted) {
       let page;
@@ -221,12 +283,16 @@ export async function runSync(
 
       for (const t of stats.truncated) {
         flushEmptyStreak();
+        noteChanged(t);
         log(`truncated ${tableLabel(t.component, t.table)}`);
       }
 
       const changed = stats.upserted > 0 || stats.deleted > 0;
       if (changed) {
         flushEmptyStreak();
+        for (const c of stats.perTable) {
+          noteChanged(c);
+        }
         lastDetail = describeChanges(stats);
         log(
           `page ${pages} | +${stats.upserted} -${stats.deleted} | ${lastDetail} | ` +
@@ -271,6 +337,8 @@ export async function runSync(
         log("server stopped paginating before reaching a consistent snapshot");
       }
 
+      await writeExport();
+
       if (!options.watch) {
         break;
       }
@@ -281,16 +349,26 @@ export async function runSync(
   } finally {
     process.removeListener("SIGINT", onSigint);
     multibar?.stop();
+    barStopped = true;
   }
 
   flushEmptyStreak();
+  // Covers the exits that skip the caught-up path: interrupt, --max-pages, a
+  // cursor that stopped advancing. The set of changed tables only lives for
+  // this process, so a run that applied changes has to write them before it
+  // goes, or the files would stay stale until those tables change again.
+  if (changedTables.size > 0) {
+    console.log("writing export files (sync progress is already saved)");
+  }
+  await writeExport();
+
   const state = store.getState();
   console.log(
     `${interrupted ? "interrupted" : "done"}: ${pages} page(s), ` +
       `${upserted} upserted, ${deleted} deleted` +
       (state.syncedTs !== null ? `, consistent at ts ${state.syncedTs}` : ""),
   );
-  for (const stat of store.tableStats()) {
+  for (const stat of await store.tableStats()) {
     console.log(`  ${tableLabel(stat.component, stat.table)}: ${stat.documents} document(s)`);
   }
   if (interrupted) {
