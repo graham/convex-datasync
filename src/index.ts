@@ -34,9 +34,21 @@ export {
   type ExportOptions,
   type TableRef,
 } from "./export.ts";
-export { parseTableFilter, selectionFromFilter, tableMatches, type TableFilter } from "./filter.ts";
+export {
+  ROOT_COMPONENT_ALIAS,
+  buildSelection,
+  needsRootTables,
+  parseColumnFilter,
+  parseComponentFilter,
+  parseTableFilter,
+  tableMatches,
+  type ColumnFilter,
+  type ComponentFilter,
+  type SelectionInput,
+  type TableFilter,
+} from "./filter.ts";
 export { runDryRun } from "./inspect.ts";
 export { writeParquetFile } from "./parquet.ts";
 export { Store } from "./store.ts";
-export { runSync, selectionForTables, type SyncOptions } from "./sync.ts";
+export { runSync, type SyncOptions } from "./sync.ts";
 export { columnValue, deriveColumns, type Column, type ColumnType } from "./tabular.ts";

@@ -4,7 +4,9 @@ Incremental export of a Convex deployment's data using the [data sync API](https
 
 Runs on plain node (>= 24; uses the built-in `node:sqlite`).
 
-Documents are mirrored into a local SQLite database. Each page from the API is applied in a single transaction together with its cursor, so the local copy is always resumable and never half-applied. Running `sync` again continues from the saved cursor and only pulls what changed.
+Documents are mirrored locally, either into a SQLite database (the default) or into an append-only log of parquet deltas (`--store log`). Either way each page from the API is applied atomically together with its cursor, so the local copy is always resumable and never half-applied. Running `sync` again continues from the saved cursor and only pulls what changed.
+
+> The data sync API requires a **Convex Pro plan** on Convex Cloud, and a deploy key with the `deployment:data:view` permission. On a free plan every command that talks to `/data/sync` fails with an authorization error.
 
 ## Setup
 
@@ -69,6 +71,11 @@ datasync sync --tables users,posts
 datasync sync --exclude-tables="^auth"       # --ignore-tables is an alias
 datasync sync --include-tables="^youtube"
 
+# Narrow further: leave columns on the server, or skip whole components.
+datasync sync --exclude-columns youtubeVideos:description
+datasync sync --include-columns title,score
+datasync sync --exclude-components videosPerGamePerDay
+
 # Keep rows for deleted documents (deleted flag set, last value preserved)
 # instead of removing them.
 datasync sync --keep-deleted
@@ -80,8 +87,9 @@ datasync sync --debug
 # Discard local data and cursor, start over.
 datasync sync --fresh
 
-# Local state and per-table document counts.
+# Local state and per-table document counts, plus the deployment's own view.
 datasync status
+datasync status --remote
 
 # Live data syncs on the deployment (server-side view, via
 # /data/list_active_syncs); the one this database follows is marked.
@@ -113,24 +121,28 @@ Fetches pages from `/data/sync` until the deployment reports the sync is caught 
 - Connection: `--url <url>`, `--deploy-key <key>` (default from env), `--prod` (the current project's prod deployment), `--deployment <name>` (any deployment, bare or `prod:`-prefixed). `--prod`/`--deployment` take precedence over env credentials and require an `npx convex login` session.
 - Storage: `--store sqlite` (default) with `--db <path>` (default `<deployment-name>.sqlite3`), or `--store log` with `--log-dir <dir>` (default `<deployment-name>.deltalog`); see [Parquet all the way down](#parquet-all-the-way-down---store-log).
 - Table selection: `--tables <a,b,c>` (exact list), or `--include-tables <regex>` / `--exclude-tables <regex>` (`--ignore-tables` is an alias for exclude). The exact list cannot be combined with the regex flags. Filters apply to root-component tables.
+- Column selection: `--exclude-columns <spec>` or `--include-columns <spec>`; see [Selecting columns and components](#selecting-columns-and-components).
+- Component selection: `--components <a,b,c>` / `--exclude-components <a,b,c>`, same section.
 - Output: `--format jsonl|json|csv|parquet` plus `--out <dir>` (default `export`) to also keep files in that format up to date; see [Syncing straight to files](#syncing-straight-to-files). Omit `--format` and sync writes only the sqlite mirror.
 - Behavior: `--keep-deleted` (mark deletions instead of removing rows), `--fresh` (discard local data and cursor first), `--fresh-export` (rewrite every `--format` file, changed or not), `--watch` (keep polling after catching up), `--interval <secs>` (watch poll interval, default 60), `--max-pages <n>` (stop after n pages; progress is saved, rerun to continue), `--debug` (log every page, including empty ones, with cursor fingerprints).
 
 ### dry-run
 
-Compares server per-table document counts against the local copy and reports which tables differ — downloads no documents. Accepts the connection, `--db`, and table-selection flags. Root-component tables only; component tables are listed but not comparable.
+Compares server per-table document counts against the local copy and reports which tables differ — downloads no documents. Accepts the connection, `--store`/`--db`/`--log-dir`, and the exact/regex table flags. Root-component tables only; component tables are listed but not comparable.
 
 ### status
 
 Offline: prints the saved syncId, status, consistency timestamp, and per-table counts (with deleted counts when `--keep-deleted` was used) from the local copy. Accepts `--store`/`--db`/`--log-dir`, `--url`, `--deployment` for locating it. `--prod` alone is rejected here (the prod deployment's name — and so its db file — requires a network call): pass `--deployment <name>` or `--db`.
 
+`--remote` additionally asks the deployment for its own view of this sync, via `GET /data/sync/:sync_id`: phase, documents synced against the total, the table it is walking, and when it last served a page. A sync goes inactive three days after its last page, and `--remote` says so explicitly rather than leaving you to discover it as a dead cursor on the next run.
+
 ### list (alias: active-syncs)
 
-Lists the deployment's live data syncs via `/data/list_active_syncs` (anything that fetched a page in the past 3 days), most recently updated first, following pagination. The sync your local database follows is marked `<- this database`. Accepts the connection flags.
+Lists the deployment's live data syncs via `/data/list_active_syncs` (anything that fetched a page in the past 3 days), most recently updated first, following pagination. The sync your local database follows is marked `<- this database`. Accepts the connection flags. To look at just your own sync, `status --remote` fetches it by id instead of listing every one.
 
 ### export
 
-Offline: dumps synced tables to `<out>/<componentPath>/<table>.<format>`. Flags: `--out <dir>` (default `export`), `--format jsonl|json|csv|parquet` (default `jsonl`), plus `--db`/`--url`/`--deployment` as in `status` (same `--prod` restriction). Exports live documents only; tombstoned rows kept by `--keep-deleted` are excluded.
+Offline: dumps synced tables to `<out>/<componentPath>/<table>.<format>`. Flags: `--out <dir>` (default `export`), `--format jsonl|json|csv|parquet` (default `jsonl`), plus `--store`/`--db`/`--log-dir`/`--url`/`--deployment` as in `status` (same `--prod` restriction). Exports live documents only; tombstoned rows kept by `--keep-deleted` are excluded.
 
 #### Tabular formats (csv, parquet)
 
@@ -225,9 +237,35 @@ select * exclude (_op, _seq, rn) from (
 
 `--format` is rejected on the commands it would not affect (`status`, `list`, `dry-run`) rather than being silently ignored.
 
+## Selecting columns and components
+
+The sync selection reaches three levels: components, their tables, and those tables' columns. Table and column flags apply to root-component tables, matching how the regex filters have always worked; component flags select whole components.
+
+```sh
+# Leave a heavy field on the server. The rest of the document still syncs.
+datasync sync --exclude-columns youtubeVideos:description
+
+# Same field name dropped from every table.
+datasync sync --exclude-columns description
+
+# Keep only these columns. _id always comes through; everything else,
+# _creationTime included, is left behind.
+datasync sync --include-columns title,score
+
+# Components, named by path. _root names the root component.
+datasync sync --exclude-components videosPerGamePerDay
+datasync sync --components _root,waitlist
+```
+
+- A column spec is a comma-separated list of `column` (applies to every root table) or `table:column` (that table only). `--include-columns` and `--exclude-columns` cannot be combined.
+- `_id` cannot be excluded — the store keys documents by it — and `--exclude-columns _id` is rejected rather than quietly ignored.
+- Under `--include-columns`, a table that no entry names keeps all of its columns. So `--include-columns games:title` narrows `games` and leaves every other table whole.
+- Column filters need the deployment's table list, since each affected table has to be named in the selection. That costs one extra call unless `--tables` already supplies the names.
+- Dropping a column stops it being transferred at all, so it also shrinks what the deployment reads. Columns removed from the selection between runs leave whatever was already synced in the local copy; use `--fresh` for a clean slate.
+
 ## Output
 
-On a TTY, sync shows a progress bar (documents synced vs the deployment total, refreshed from `/data/list_active_syncs`) with per-page log lines above it: tables changed, upsert/delete counts, fetch/apply timing. Pages with no matching changes are aggregated into a single "empty page(s) scanned" line instead of being logged individually — the server paginates over its internal scan, so empty pages are normal while it walks data outside your selection.
+On a TTY, sync shows a progress bar (documents synced vs the deployment total, refreshed from `/data/sync/:sync_id`) with per-page log lines above it: tables changed, upsert/delete counts, fetch/apply timing. Pages with no matching changes are aggregated into a single "empty page(s) scanned" line instead of being logged individually — the server paginates over its internal scan, so empty pages are normal while it walks data outside your selection.
 
 ## Interrupting a sync
 
@@ -240,6 +278,7 @@ Ctrl-c is always safe. Every page is applied to SQLite in one transaction togeth
 - The cursor is stored in the SQLite database next to the data. The next run resumes from it.
 - A cursor expires if unused for 3 days. When that happens the tool exits with instructions to rerun with `--fresh`.
 - Deselecting a table between runs (via `--tables` or the regex filters) stops exporting it, but documents already synced from it stay in the local database; use `--fresh` if you want a clean slate.
+- Convex timestamps are int64 nanoseconds, which exceed what a JS number holds exactly, so the `syncedTs` shown by `status` and the sync summary can differ from the deployment's value in the last couple of digits. It is display only — nothing keys off it.
 - `dry-run` compares per-table document counts (the same numbers the dashboard shows) between the server and the local copy. It downloads no documents. Counts cannot detect in-place updates, and the regex filters only apply to root-component tables; component tables are listed but not compared.
 
 ## Development

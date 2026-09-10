@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import { isCaughtUp, type DataSyncResponse } from "../src/api.ts";
-import { selectionForTables } from "../src/sync.ts";
 
 function page(
   status: DataSyncResponse["status"],
@@ -34,15 +33,3 @@ describe("isCaughtUp", () => {
   });
 });
 
-describe("selectionForTables", () => {
-  test("includes only the listed root-component tables", () => {
-    assert.deepEqual(selectionForTables(["users", "posts"]), {
-      _other: "excl",
-      "": {
-        _other: "excl",
-        users: { _other: "incl" },
-        posts: { _other: "incl" },
-      },
-    });
-  });
-});

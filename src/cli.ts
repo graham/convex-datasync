@@ -6,10 +6,17 @@ import { loadEnvFiles, localDeploymentName, resolveConnection } from "./config.t
 import type { DataStore } from "./datastore.ts";
 import { DeltaLogStore } from "./deltalog.ts";
 import { EXPORT_FORMATS, isExportFormat, runExport } from "./export.ts";
-import { parseTableFilter, selectionFromFilter, tableMatches } from "./filter.ts";
+import {
+  buildSelection,
+  needsRootTables,
+  parseColumnFilter,
+  parseComponentFilter,
+  parseTableFilter,
+  tableMatches,
+} from "./filter.ts";
 import { runDryRun } from "./inspect.ts";
 import { Store, type StoreOptions } from "./store.ts";
-import { runSync, selectionForTables } from "./sync.ts";
+import { runSync } from "./sync.ts";
 
 const USAGE = `datasync - incremental Convex deployment data sync
 
@@ -18,6 +25,7 @@ Usage:
                                 writing sqlite plus --format files if given
   datasync dry-run [options]  compare server vs local document counts, download nothing
   datasync status             show local sync state and per-table counts
+                                (--remote also asks the deployment for its view)
   datasync list               list live data syncs on the deployment
                                  (active-syncs is an alias)
   datasync export [options]   dump synced tables to files
@@ -43,6 +51,13 @@ Options:
   --include-tables <re>  only sync root tables whose name matches this regex
   --exclude-tables <re>  skip root tables whose name matches this regex
                          (--ignore-tables is an alias; e.g. --exclude-tables="^auth")
+  --components <a,b,c>   only sync these components (_root names the root one)
+  --exclude-components <a,b,c>  skip these components
+  --include-columns <spec>  keep only these columns of each root table; entries
+                         are 'column' (every table) or 'table:column'. _id is
+                         always kept
+  --exclude-columns <spec>  drop these columns instead, same spec syntax
+                         (e.g. --exclude-columns youtubeVideos:description)
   --keep-deleted       keep rows for deleted documents (marked with a deleted
                        flag, last-synced value preserved) instead of removing them
   --fresh              discard local data and cursor, restart sync from scratch
@@ -82,6 +97,11 @@ async function main(): Promise<void> {
       "include-tables": { type: "string" },
       "exclude-tables": { type: "string" },
       "ignore-tables": { type: "string" },
+      components: { type: "string" },
+      "exclude-components": { type: "string" },
+      "include-columns": { type: "string" },
+      "exclude-columns": { type: "string" },
+      remote: { type: "boolean", default: false },
       "keep-deleted": { type: "boolean", default: false },
       fresh: { type: "boolean", default: false },
       "fresh-export": { type: "boolean", default: false },
@@ -121,6 +141,48 @@ async function main(): Promise<void> {
   }
   if (freshExport && requestedFormat === undefined) {
     fail("--fresh-export needs --format <fmt>; without it sync writes no files to refresh");
+  }
+
+  const remote = values.remote as boolean;
+  if (remote && command !== "status") {
+    fail(`--remote has no effect on ${command}; it applies to status`);
+  }
+  const selectionFlags = {
+    components: values.components,
+    "exclude-components": values["exclude-components"],
+    "include-columns": values["include-columns"],
+    "exclude-columns": values["exclude-columns"],
+  };
+  for (const [flag, value] of Object.entries(selectionFlags)) {
+    if (value !== undefined && command !== "sync") {
+      fail(`--${flag} has no effect on ${command}; it applies to sync`);
+    }
+  }
+
+  // Parsed before any network work so a bad pattern or column spec fails
+  // immediately rather than after credentials are resolved.
+  let filter;
+  let componentFilter;
+  let columnFilter;
+  try {
+    filter = parseTableFilter(
+      values["include-tables"] as string | undefined,
+      (values["exclude-tables"] as string | undefined) ??
+        (values["ignore-tables"] as string | undefined),
+    );
+    componentFilter = parseComponentFilter(
+      values.components as string | undefined,
+      values["exclude-components"] as string | undefined,
+    );
+    columnFilter = parseColumnFilter(
+      values["include-columns"] as string | undefined,
+      values["exclude-columns"] as string | undefined,
+    );
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
+  if (filter && values.tables) {
+    fail("--tables cannot be combined with --include-tables/--exclude-tables");
   }
 
   const storeKind = values.store as string;
@@ -196,6 +258,35 @@ async function main(): Promise<void> {
         const deleted = stat.deletedDocuments > 0 ? ` (+${stat.deletedDocuments} deleted)` : "";
         console.log(`${stat.component || "<root>"}/${stat.table}: ${stat.documents}${deleted}`);
       }
+      if (remote) {
+        const connection = await resolveConnection({
+          url: values.url as string | undefined,
+          deployKey: values["deploy-key"] as string | undefined,
+          deployment: values.deployment as string | undefined,
+          prod: values.prod as boolean,
+        });
+        const sync = await new DataSyncClient(connection.url, connection.deployKey).getActiveSync(
+          state.syncId,
+        );
+        console.log();
+        if (sync === null) {
+          console.log(
+            `server: sync ${state.syncId} is no longer active (a sync expires 3 days after its`,
+          );
+          console.log("        last page; run sync --fresh to start over)");
+        } else {
+          const s = sync.status;
+          const progress =
+            s.currentTable !== undefined
+              ? `, currently ${s.currentComponent || "<root>"}/${s.currentTable} ` +
+                `(table ${(s.numTablesSynced ?? 0) + 1}/${s.totalTables ?? "?"})`
+              : "";
+          console.log(
+            `server: ${s.type}, ${s.numDocumentsSynced ?? 0}/${s.totalDocuments ?? "?"} docs${progress}`,
+          );
+          console.log(`        last page ${new Date(sync.lastUpdated).toISOString()}`);
+        }
+      }
     } finally {
       store.close();
     }
@@ -260,15 +351,6 @@ async function main(): Promise<void> {
     return;
   }
 
-  const filter = parseTableFilter(
-    values["include-tables"] as string | undefined,
-    (values["exclude-tables"] as string | undefined) ??
-      (values["ignore-tables"] as string | undefined),
-  );
-  if (filter && values.tables) {
-    fail("--tables cannot be combined with --include-tables/--exclude-tables");
-  }
-
   if (command === "dry-run") {
     const store = openStore(connection.deploymentName);
     try {
@@ -294,26 +376,49 @@ async function main(): Promise<void> {
       fail(`invalid --max-pages: ${values["max-pages"]}`);
     }
   }
-  let selection = values.tables
-    ? selectionForTables(
-        (values.tables as string)
-          .split(",")
-          .map((t) => t.trim())
-          .filter((t) => t.length > 0),
-      )
-    : undefined;
-  if (filter) {
-    const rootTables = await client.listRootTables();
-    const included = rootTables.filter((t) => tableMatches(t, filter));
-    const excluded = rootTables.filter((t) => !tableMatches(t, filter));
-    if (included.length === 0) {
-      fail("table filter matches no tables on the deployment");
+  const tables = values.tables
+    ? (values.tables as string)
+        .split(",")
+        .map((t) => t.trim())
+        .filter((t) => t.length > 0)
+    : null;
+  const selectionInput = {
+    tables,
+    tableFilter: filter,
+    components: componentFilter,
+    columns: columnFilter,
+  };
+  // Regex table filters and column filters both have to name every table in
+  // the selection, so they need the deployment's table list first.
+  let rootTables: string[] | null = null;
+  if (needsRootTables(selectionInput)) {
+    rootTables = await client.listRootTables();
+    if (filter) {
+      const included = rootTables.filter((t) => tableMatches(t, filter));
+      const excluded = rootTables.filter((t) => !tableMatches(t, filter));
+      if (included.length === 0) {
+        fail("table filter matches no tables on the deployment");
+      }
+      console.log(`syncing ${included.length} table(s): ${included.join(", ")}`);
+      if (excluded.length > 0) {
+        console.log(`skipping ${excluded.length} table(s): ${excluded.join(", ")}`);
+      }
     }
-    console.log(`syncing ${included.length} table(s): ${included.join(", ")}`);
-    if (excluded.length > 0) {
-      console.log(`skipping ${excluded.length} table(s): ${excluded.join(", ")}`);
-    }
-    selection = selectionFromFilter(rootTables, filter);
+  }
+  const selection = buildSelection({ ...selectionInput, rootTables });
+  if (columnFilter) {
+    const scope = columnFilter.mode === "include" ? "keeping only" : "dropping";
+    const named = [
+      ...columnFilter.all,
+      ...[...columnFilter.byTable].flatMap(([t, c]) => [...c].map((n) => `${t}:${n}`)),
+    ];
+    console.log(`${scope} column(s): ${named.join(", ")}`);
+  }
+  if (componentFilter?.include) {
+    console.log(`syncing component(s): ${[...componentFilter.include].join(", ")}`);
+  }
+  if (componentFilter?.exclude) {
+    console.log(`skipping component(s): ${[...componentFilter.exclude].join(", ")}`);
   }
 
   const store = openStore(connection.deploymentName, {

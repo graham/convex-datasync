@@ -36,23 +36,10 @@ function cursorFingerprint(cursor: string | null): string {
   return `${cursor.length}ch ${cursor.slice(0, 12)}..${cursor.slice(-8)}`;
 }
 
-// How often to refresh totals from /data/list_active_syncs for the progress bar.
+// How often to refresh totals from /data/sync/:sync_id for the progress bar.
 const TOTALS_REFRESH_MS = 5000;
 // Log a heartbeat after this many consecutive pages with no changes.
 const EMPTY_PAGE_LOG_EVERY = 100;
-
-// Builds a selection that exports only the given tables of the root component,
-// with all their columns.
-export function selectionForTables(tables: string[]): Selection {
-  const root: Record<string, { _other: "incl" }> = {};
-  for (const table of tables) {
-    root[table] = { _other: "incl" };
-  }
-  return {
-    _other: "excl",
-    "": { _other: "excl", ...root },
-  };
-}
 
 function tableLabel(component: string, table: string): string {
   return component ? `${component}/${table}` : table;
@@ -161,8 +148,9 @@ export async function runSync(
     }
     lastTotalsFetch = Date.now();
     try {
-      const response = await client.listActiveSyncs(cancel.signal);
-      const mine = response.syncs.find((s) => s.syncId === syncId);
+      // Keyed lookup rather than paging through every sync on the deployment
+      // just to find this one.
+      const mine = await client.getActiveSync(syncId, cancel.signal);
       if (!mine) {
         return;
       }

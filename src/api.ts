@@ -197,6 +197,26 @@ export class DataSyncClient {
     return this.request<DataSyncResponse>("POST", "/data/sync", args, signal);
   }
 
+  // Server-side progress of one sync, or null when the deployment does not
+  // know it any more: a sync goes inactive 3 days after its last /data/sync
+  // call, and unknown or expired ids answer 404.
+  async getActiveSync(syncId: string, signal?: AbortSignal): Promise<ActiveDataSync | null> {
+    try {
+      return await this.request<ActiveDataSync>(
+        "GET",
+        `/data/sync/${encodeURIComponent(syncId)}`,
+        undefined,
+        signal,
+      );
+    } catch (error) {
+      // 404 DataSyncNotFound: unknown id, or one that went inactive.
+      if (error instanceof ApiError && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
   // Follows pagination (the endpoint returns pages of syncs, most recently
   // updated first) and returns the combined list.
   async listActiveSyncs(signal?: AbortSignal): Promise<ListActiveSyncsResponse> {
