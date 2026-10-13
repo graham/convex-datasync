@@ -20,8 +20,8 @@ const outDir = (): string => join(root, `out${counter++}`);
 
 function caughtUpPage(values: DataSyncResponse["values"]): DataSyncResponse {
   return {
-    pagination: { hasMore: false, nextCursor: "c" },
-    status: { type: "synced", syncedTs: 1 },
+    pagination: { hasMore: true, nextCursor: "c" },
+    status: { type: "upToDate", snapshotTs: 1n },
     syncId: "s",
     truncates: [],
     values,
@@ -29,7 +29,7 @@ function caughtUpPage(values: DataSyncResponse["values"]): DataSyncResponse {
 }
 
 function upsert(table: string, value: Record<string, unknown>, component = "") {
-  return { component, table, deleted: false, ts: 1, value };
+  return { component, table, deleted: false, ts: 1n, value };
 }
 
 // Serves the given pages in order, then keeps returning an empty caught-up
@@ -111,7 +111,7 @@ describe("sync --format", () => {
       store,
       [
         caughtUpPage([
-          { component: "", table: "users", deleted: true, ts: 2, value: { _id: "u2" } },
+          { component: "", table: "users", deleted: true, ts: 2n, value: { _id: "u2" } },
         ]),
       ],
       target,
@@ -249,7 +249,7 @@ describe("sync --format", () => {
       clientServing([
         {
           pagination: { hasMore: true, nextCursor: "c1" },
-          status: { type: "inProgress" },
+          status: { type: "snapshotting" },
           syncId: "s",
           truncates: [],
           values: [upsert("users", { _id: "u1", n: 1 })],

@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { existsSync, renameSync } from "node:fs";
 import { parseArgs } from "node:util";
-import { DataSyncClient } from "./api.ts";
+import { DataSyncClient, type ActiveDataSync } from "./api.ts";
 import { loadEnvFiles, localDeploymentName, resolveConnection } from "./config.ts";
 import type { DataStore } from "./datastore.ts";
 import { DeltaLogStore } from "./deltalog.ts";
 import { EXPORT_FORMATS, isExportFormat, runExport } from "./export.ts";
+import { runDryRun } from "./inspect.ts";
 import {
   buildSelection,
   needsRootTables,
@@ -13,8 +14,7 @@ import {
   parseComponentFilter,
   parseTableFilter,
   tableMatches,
-} from "./filter.ts";
-import { runDryRun } from "./inspect.ts";
+} from "./selection.ts";
 import { Store, type StoreOptions } from "./store.ts";
 import { runSync } from "./sync.ts";
 
@@ -23,10 +23,11 @@ const USAGE = `datasync - incremental Convex deployment data sync
 Usage:
   datasync sync [options]     fetch pages until caught up (resumes from saved cursor),
                                 writing sqlite plus --format files if given
-  datasync dry-run [options]  compare server vs local document counts, download nothing
+  datasync dry-run [options]  show what a sync would cover and how far the local copy is
+                                from the deployment, downloading nothing
   datasync status             show local sync state and per-table counts
                                 (--remote also asks the deployment for its view)
-  datasync list               list live data syncs on the deployment
+  datasync list [--limit <n>] list live data syncs on the deployment
                                  (active-syncs is an alias)
   datasync export [options]   dump synced tables to files
 
@@ -53,11 +54,12 @@ Options:
                          (--ignore-tables is an alias; e.g. --exclude-tables="^auth")
   --components <a,b,c>   only sync these components (_root names the root one)
   --exclude-components <a,b,c>  skip these components
-  --include-columns <spec>  keep only these columns of each root table; entries
-                         are 'column' (every table) or 'table:column'. _id is
-                         always kept
+  --include-columns <spec>  keep only these columns; entries are 'table:column',
+                         or a bare 'column' for every table --tables or the
+                         table regexes select. _id is always kept
   --exclude-columns <spec>  drop these columns instead, same spec syntax
                          (e.g. --exclude-columns youtubeVideos:description)
+  --limit <n>          list: return at most n syncs, 1 to 100 (default: all)
   --keep-deleted       keep rows for deleted documents (marked with a deleted
                        flag, last-synced value preserved) instead of removing them
   --fresh              discard local data and cursor, restart sync from scratch
@@ -75,10 +77,94 @@ Options:
   --help               show this help
 `;
 
+// One line of what the deployment reports for a sync, shared by `list` and
+// `status --remote`. Only a sync that is still traversing carries per-table
+// progress; a caught-up one reports its consistent timestamp instead.
+function describeActiveSync(sync: ActiveDataSync): string {
+  const s = sync.status;
+  if (s.type === "snapshotting") {
+    return (
+      `snapshotting, ${s.numTablesSynced}/${s.totalTables} tables, ` +
+      `${s.numDocumentsSynced}/${s.totalDocuments} docs ` +
+      `(currently ${s.currentComponent || "<root>"}/${s.currentTable})`
+    );
+  }
+  const note = s.type === "stale" ? " (newer changes are still streaming)" : "";
+  return (
+    `${s.type}${note}, ${s.totalTables} table(s), ${s.numDocumentsSynced} docs synced, ` +
+    `consistent at ts ${s.syncedTs}`
+  );
+}
+
 function fail(message: string): never {
   console.error(message);
   process.exit(1);
 }
+
+// Which commands each flag means something to. A flag given to any other
+// command is an error: a flag that parses and then does nothing is how
+// `sync --format parquet` once wrote no parquet at all.
+const SYNC = ["sync"];
+// Flags that choose what a sync covers also describe the scope a dry run shows.
+const SCOPE = ["sync", "dry-run"];
+const ALL = ["sync", "dry-run", "status", "export", "list", "active-syncs"];
+const STORE = ALL;
+const FLAG_COMMANDS: Record<string, string[]> = {
+  url: ALL,
+  "deploy-key": ["sync", "dry-run", "list", "active-syncs", "status"],
+  prod: ALL,
+  deployment: ALL,
+  store: STORE,
+  db: STORE,
+  "log-dir": STORE,
+  tables: SCOPE,
+  "include-tables": SCOPE,
+  "exclude-tables": SCOPE,
+  "ignore-tables": SCOPE,
+  components: SCOPE,
+  "exclude-components": SCOPE,
+  "include-columns": SCOPE,
+  "exclude-columns": SCOPE,
+  "keep-deleted": SYNC,
+  fresh: SYNC,
+  "fresh-export": SYNC,
+  watch: SYNC,
+  interval: SYNC,
+  "max-pages": SYNC,
+  debug: SYNC,
+  out: ["sync", "export"],
+  format: ["sync", "export"],
+  remote: ["status"],
+  limit: ["list", "active-syncs"],
+};
+
+// Flags the user actually typed, as opposed to ones parseArgs filled in with
+// a default.
+function typedFlags(): Set<string> {
+  const typed = new Set<string>();
+  for (const arg of process.argv.slice(2)) {
+    if (arg === "--") {
+      break;
+    }
+    const match = /^--([a-z-]+)(=|$)/.exec(arg);
+    if (match?.[1]) {
+      typed.add(match[1]);
+    }
+  }
+  return typed;
+}
+
+function rejectInapplicableFlags(command: string): void {
+  for (const flag of typedFlags()) {
+    const commands = FLAG_COMMANDS[flag];
+    if (commands !== undefined && !commands.includes(command)) {
+      const applies = [...new Set(commands.map((c) => (c === "active-syncs" ? "list" : c)))];
+      fail(`--${flag} has no effect on ${command}; it applies to ${applies.join(", ")}`);
+    }
+  }
+}
+
+const KNOWN_COMMANDS = new Set(["sync", "dry-run", "status", "export", "list", "active-syncs", "help"]);
 
 async function main(): Promise<void> {
   loadEnvFiles();
@@ -102,6 +188,7 @@ async function main(): Promise<void> {
       "include-columns": { type: "string" },
       "exclude-columns": { type: "string" },
       remote: { type: "boolean", default: false },
+      limit: { type: "string" },
       "keep-deleted": { type: "boolean", default: false },
       fresh: { type: "boolean", default: false },
       "fresh-export": { type: "boolean", default: false },
@@ -119,6 +206,9 @@ async function main(): Promise<void> {
   if (values.help || command === "help") {
     console.log(USAGE);
     return;
+  }
+  if (!KNOWN_COMMANDS.has(command)) {
+    fail(`unknown command: ${command}\n\n${USAGE}`);
   }
 
   // --format is optional everywhere: export falls back to jsonl, sync writes
@@ -154,18 +244,38 @@ async function main(): Promise<void> {
     "exclude-columns": values["exclude-columns"],
   };
   for (const [flag, value] of Object.entries(selectionFlags)) {
-    if (value !== undefined && command !== "sync") {
-      fail(`--${flag} has no effect on ${command}; it applies to sync`);
+    if (value !== undefined && command !== "sync" && command !== "dry-run") {
+      fail(`--${flag} has no effect on ${command}; it applies to sync and dry-run`);
     }
   }
 
-  // Parsed before any network work so a bad pattern or column spec fails
-  // immediately rather than after credentials are resolved.
-  let filter;
+  const isList = command === "list" || command === "active-syncs";
+  let listLimit: number | undefined;
+  if (values.limit !== undefined) {
+    if (!isList) {
+      fail(`--limit has no effect on ${command}; it applies to list`);
+    }
+    listLimit = Number(values.limit);
+    // The deployment answers 400 outside this range rather than clamping.
+    if (!Number.isInteger(listLimit) || listLimit < 1 || listLimit > 100) {
+      fail(`invalid --limit: ${values.limit} (expected a whole number from 1 to 100)`);
+    }
+  }
+
+  // Parsed before any network work so a bad column spec fails immediately
+  // rather than after credentials are resolved.
+  let tableFilter;
   let componentFilter;
   let columnFilter;
+  let selection;
+  const tables = values.tables
+    ? (values.tables as string)
+        .split(",")
+        .map((t) => t.trim())
+        .filter((t) => t.length > 0)
+    : null;
   try {
-    filter = parseTableFilter(
+    tableFilter = parseTableFilter(
       values["include-tables"] as string | undefined,
       (values["exclude-tables"] as string | undefined) ??
         (values["ignore-tables"] as string | undefined),
@@ -178,12 +288,21 @@ async function main(): Promise<void> {
       values["include-columns"] as string | undefined,
       values["exclude-columns"] as string | undefined,
     );
+    if (tables !== null && tableFilter !== null) {
+      throw new Error("--tables cannot be combined with --include-tables/--exclude-tables");
+    }
+    // A regex filter has to be resolved against the deployment's tables, so
+    // that selection waits until there is a connection. Checking it now, with
+    // no tables to resolve against, would wrongly reject a table:column entry
+    // for a table the pattern does select.
+    if (!needsRootTables({ tableFilter })) {
+      selection = buildSelection({ tables, components: componentFilter, columns: columnFilter });
+    }
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }
-  if (filter && values.tables) {
-    fail("--tables cannot be combined with --include-tables/--exclude-tables");
-  }
+
+  rejectInapplicableFlags(command);
 
   const storeKind = values.store as string;
   if (storeKind !== "sqlite" && storeKind !== "log") {
@@ -275,15 +394,7 @@ async function main(): Promise<void> {
           );
           console.log("        last page; run sync --fresh to start over)");
         } else {
-          const s = sync.status;
-          const progress =
-            s.currentTable !== undefined
-              ? `, currently ${s.currentComponent || "<root>"}/${s.currentTable} ` +
-                `(table ${(s.numTablesSynced ?? 0) + 1}/${s.totalTables ?? "?"})`
-              : "";
-          console.log(
-            `server: ${s.type}, ${s.numDocumentsSynced ?? 0}/${s.totalDocuments ?? "?"} docs${progress}`,
-          );
+          console.log(`server: ${describeActiveSync(sync)}`);
           console.log(`        last page ${new Date(sync.lastUpdated).toISOString()}`);
         }
       }
@@ -315,7 +426,10 @@ async function main(): Promise<void> {
   const client = new DataSyncClient(connection.url, connection.deployKey);
 
   if (command === "list" || command === "active-syncs") {
-    const response = await client.listActiveSyncs();
+    const response =
+      listLimit === undefined
+        ? await client.listActiveSyncs()
+        : await client.listActiveSyncsPage({ limit: listLimit });
     if (response.syncs.length === 0) {
       console.log("no active syncs");
       return;
@@ -323,41 +437,68 @@ async function main(): Promise<void> {
     // Mark the sync this machine's database is following, if any.
     let localSyncId: string | null = null;
     if (existsSync(storePathFor(connection.deploymentName))) {
-      const store = openStore(connection.deploymentName);
+      // Only used to mark which sync is ours, so a local copy that cannot be
+      // read must not stop the listing.
       try {
-        localSyncId = store.getState().syncId;
-      } finally {
-        store.close();
+        const store = openStore(connection.deploymentName);
+        try {
+          localSyncId = store.getState().syncId;
+        } finally {
+          store.close();
+        }
+      } catch (error) {
+        console.warn(
+          `note: could not read the local copy to mark your sync: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
     for (const sync of response.syncs) {
       const updated = new Date(sync.lastUpdated).toISOString();
-      const s = sync.status;
-      const ts = s.snapshotTs ?? s.syncedTs;
       const mine = sync.syncId === localSyncId ? "  <- this database" : "";
-      if (s.currentTable !== undefined) {
-        console.log(
-          `${sync.syncId}: ${s.type}, ${s.numTablesSynced ?? 0}/${s.totalTables ?? "?"} tables, ` +
-            `${s.numDocumentsSynced ?? 0}/${s.totalDocuments ?? "?"} docs ` +
-            `(currently ${s.currentComponent || "<root>"}/${s.currentTable}), updated ${updated}${mine}`,
-        );
-      } else {
-        console.log(
-          `${sync.syncId}: ${s.type}${ts !== undefined ? ` at ts ${ts}` : ""}, ` +
-            `${s.numDocumentsSynced ?? 0} docs, updated ${updated}${mine}`,
-        );
-      }
+      console.log(`${sync.syncId}: ${describeActiveSync(sync)}, updated ${updated}${mine}`);
+    }
+    if (listLimit !== undefined && response.pagination.hasMore) {
+      console.log(`(more syncs exist; omit --limit to list them all)`);
     }
     return;
   }
 
   if (command === "dry-run") {
-    const store = openStore(connection.deploymentName);
-    try {
-      await runDryRun(client, store, filter);
-    } finally {
-      store.close();
+    // Reading the local copy must not create one: before the first sync there
+    // is nothing local, and that is exactly what a dry run should report.
+    let localStats: Awaited<ReturnType<DataStore["tableStats"]>> = [];
+    if (existsSync(storePathFor(connection.deploymentName))) {
+      const store = openStore(connection.deploymentName);
+      try {
+        localStats = await store.tableStats();
+      } finally {
+        store.close();
+      }
     }
+    await runDryRun(
+      client,
+      localStats,
+      {
+        tables,
+        tableFilter: tableFilter ?? null,
+        components: componentFilter ?? null,
+        columns: columnFilter ?? null,
+      },
+      (rootTables) => {
+        try {
+          buildSelection({
+            tables,
+            tableFilter,
+            rootTables,
+            components: componentFilter,
+            columns: columnFilter,
+          });
+        } catch (error) {
+          fail(error instanceof Error ? error.message : String(error));
+        }
+      },
+    );
     return;
   }
 
@@ -376,36 +517,31 @@ async function main(): Promise<void> {
       fail(`invalid --max-pages: ${values["max-pages"]}`);
     }
   }
-  const tables = values.tables
-    ? (values.tables as string)
-        .split(",")
-        .map((t) => t.trim())
-        .filter((t) => t.length > 0)
-    : null;
-  const selectionInput = {
-    tables,
-    tableFilter: filter,
-    components: componentFilter,
-    columns: columnFilter,
-  };
-  // Regex table filters and column filters both have to name every table in
-  // the selection, so they need the deployment's table list first.
-  let rootTables: string[] | null = null;
-  if (needsRootTables(selectionInput)) {
-    rootTables = await client.listRootTables();
-    if (filter) {
-      const included = rootTables.filter((t) => tableMatches(t, filter));
-      const excluded = rootTables.filter((t) => !tableMatches(t, filter));
-      if (included.length === 0) {
-        fail("table filter matches no tables on the deployment");
-      }
-      console.log(`syncing ${included.length} table(s): ${included.join(", ")}`);
-      if (excluded.length > 0) {
-        console.log(`skipping ${excluded.length} table(s): ${excluded.join(", ")}`);
-      }
+  if (tableFilter) {
+    const rootTables = await client.listRootTables();
+    const included = rootTables.filter((t) => tableMatches(t, tableFilter));
+    const excluded = rootTables.filter((t) => !tableMatches(t, tableFilter));
+    if (included.length === 0) {
+      fail("table filter matches no tables on the deployment");
     }
+    console.log(`syncing ${included.length} table(s): ${included.join(", ")}`);
+    if (excluded.length > 0) {
+      console.log(`skipping ${excluded.length} table(s): ${excluded.join(", ")}`);
+    }
+    try {
+      selection = buildSelection({
+        tables,
+        tableFilter,
+        rootTables,
+        components: componentFilter,
+        columns: columnFilter,
+      });
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+    }
+  } else if (tables) {
+    console.log(`syncing table(s): ${tables.join(", ")}`);
   }
-  const selection = buildSelection({ ...selectionInput, rootTables });
   if (columnFilter) {
     const scope = columnFilter.mode === "include" ? "keeping only" : "dropping";
     const named = [

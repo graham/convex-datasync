@@ -48,10 +48,8 @@ function tableLabel(component: string, table: string): string {
 function statusLabel(type: string): string {
   switch (type) {
     case "upToDate":
-    case "synced":
       return "up to date";
     case "snapshotting":
-    case "inProgress":
       return "snapshotting";
     case "stale":
       return "catching up";
@@ -154,11 +152,17 @@ export async function runSync(
       if (!mine) {
         return;
       }
-      totalDocs = mine.status.totalDocuments ?? mine.status.numDocumentsSynced ?? totalDocs;
-      if (mine.status.currentTable !== undefined) {
+      // Only a sync that is still traversing reports totals and the table it
+      // is on; once it has a consistent snapshot, what it has synced is all
+      // there is to show.
+      const status = mine.status;
+      if (status.type === "snapshotting") {
+        totalDocs = status.totalDocuments;
         lastDetail =
-          `${tableLabel(mine.status.currentComponent ?? "", mine.status.currentTable)} ` +
-          `(table ${(mine.status.numTablesSynced ?? 0) + 1}/${mine.status.totalTables ?? "?"})`;
+          `${tableLabel(status.currentComponent, status.currentTable)} ` +
+          `(table ${status.numTablesSynced + 1}/${status.totalTables})`;
+      } else {
+        totalDocs = Math.max(totalDocs, status.numDocumentsSynced);
       }
     } catch {
       // Totals are best-effort display data; never fail the sync over them.
@@ -227,6 +231,15 @@ export async function runSync(
         if (interrupted) {
           break;
         }
+        if (error instanceof ApiError && error.cursorInvalid) {
+          multibar?.stop();
+          console.error("the saved cursor is not valid and cannot be resumed.");
+          console.error(
+            "run again with --fresh to clear local data and restart from scratch.",
+          );
+          process.exitCode = 1;
+          return;
+        }
         if (error instanceof ApiError && error.cursorExpired) {
           multibar?.stop();
           console.error(
@@ -259,12 +272,15 @@ export async function runSync(
       if (options.debug) {
         log(
           `debug page ${pages} | syncId ${page.syncId} | values ${page.values.length} ` +
-            `truncates ${page.truncates.length} | hasMore ${page.pagination.hasMore} | ` +
+            `truncates ${page.truncates.length} | ` +
             `status ${page.status.type} | fetch ${fetchMs}ms apply ${applyMs}ms | ` +
             `cursor ${cursorFingerprint(previousCursor)} -> ${cursorFingerprint(cursor)}`,
         );
       }
-      if (cursor !== null && cursor === previousCursor && page.pagination.hasMore) {
+      const caughtUp = isCaughtUp(page);
+      // While traversing, every page has to move the cursor on or the loop
+      // would spin forever. A caught-up poll with nothing new may repeat it.
+      if (!caughtUp && cursor !== null && cursor === previousCursor) {
         log("warning: cursor did not advance between pages; aborting to avoid an infinite loop");
         break;
       }
@@ -296,7 +312,6 @@ export async function runSync(
         }
       }
 
-      const caughtUp = isCaughtUp(page);
       await refreshTotals();
       if (bar) {
         const done = upserted + deleted;
@@ -314,15 +329,12 @@ export async function runSync(
         break;
       }
 
-      // hasMore is not a stop signal on its own: the live API keeps it true
-      // even once caught up. Stop (or sleep, in watch mode) on the status.
+      // The endpoint is an infinite stream: hasMore is always true and there is
+      // always a next cursor. The status is the only thing that says the sync
+      // has caught up, at which point a one-time sync is done and a continuous
+      // one backs off to wait for more writes.
       if (!caughtUp) {
         continue;
-      }
-
-      if (!page.pagination.hasMore && page.status.type !== "upToDate" && page.status.type !== "synced") {
-        flushEmptyStreak();
-        log("server stopped paginating before reaching a consistent snapshot");
       }
 
       await writeExport();

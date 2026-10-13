@@ -7,7 +7,7 @@ import { Store } from "../src/store.ts";
 function page(overrides: Partial<DataSyncResponse>): DataSyncResponse {
   return {
     pagination: { hasMore: true, nextCursor: "cursor-1" },
-    status: { type: "inProgress" },
+    status: { type: "snapshotting" },
     syncId: "sync-1",
     truncates: [],
     values: [],
@@ -25,8 +25,8 @@ describe("Store.applyPage", () => {
     const stats = store.applyPage(
       page({
         values: [
-          { component: "", table: "users", deleted: false, ts: 10, value: doc("u1", { name: "a" }) },
-          { component: "", table: "users", deleted: false, ts: 11, value: doc("u2", { name: "b" }) },
+          { component: "", table: "users", deleted: false, ts: 10n, value: doc("u1", { name: "a" }) },
+          { component: "", table: "users", deleted: false, ts: 11n, value: doc("u2", { name: "b" }) },
         ],
       }),
     );
@@ -42,15 +42,15 @@ describe("Store.applyPage", () => {
     store.applyPage(
       page({
         values: [
-          { component: "", table: "users", deleted: false, ts: 10, value: doc("u1", { name: "old" }) },
+          { component: "", table: "users", deleted: false, ts: 10n, value: doc("u1", { name: "old" }) },
         ],
       }),
     );
     store.applyPage(
       page({
-        pagination: { hasMore: false, nextCursor: "cursor-2" },
+        pagination: { hasMore: true, nextCursor: "cursor-2" },
         values: [
-          { component: "", table: "users", deleted: false, ts: 20, value: doc("u1", { name: "new" }) },
+          { component: "", table: "users", deleted: false, ts: 20n, value: doc("u1", { name: "new" }) },
         ],
       }),
     );
@@ -66,13 +66,13 @@ describe("Store.applyPage", () => {
     store.applyPage(
       page({
         values: [
-          { component: "", table: "users", deleted: false, ts: 10, value: doc("u1") },
+          { component: "", table: "users", deleted: false, ts: 10n, value: doc("u1") },
         ],
       }),
     );
     const stats = store.applyPage(
       page({
-        values: [{ component: "", table: "users", deleted: true, ts: 20, value: { _id: "u1" } }],
+        values: [{ component: "", table: "users", deleted: true, ts: 20n, value: { _id: "u1" } }],
       }),
     );
     assert.equal(stats.deleted, 1);
@@ -85,8 +85,8 @@ describe("Store.applyPage", () => {
     store.applyPage(
       page({
         values: [
-          { component: "", table: "users", deleted: false, ts: 10, value: doc("u1") },
-          { component: "", table: "users", deleted: false, ts: 10, value: doc("u2") },
+          { component: "", table: "users", deleted: false, ts: 10n, value: doc("u1") },
+          { component: "", table: "users", deleted: false, ts: 10n, value: doc("u2") },
         ],
       }),
     );
@@ -94,7 +94,7 @@ describe("Store.applyPage", () => {
       page({
         truncates: [{ component: "", table: "users" }],
         values: [
-          { component: "", table: "users", deleted: false, ts: 30, value: doc("u3") },
+          { component: "", table: "users", deleted: false, ts: 30n, value: doc("u3") },
         ],
       }),
     );
@@ -107,8 +107,8 @@ describe("Store.applyPage", () => {
     store.applyPage(
       page({
         values: [
-          { component: "", table: "users", deleted: false, ts: 10, value: doc("u1") },
-          { component: "waitlist", table: "users", deleted: false, ts: 10, value: doc("w1") },
+          { component: "", table: "users", deleted: false, ts: 10n, value: doc("u1") },
+          { component: "waitlist", table: "users", deleted: false, ts: 10n, value: doc("w1") },
         ],
       }),
     );
@@ -118,21 +118,35 @@ describe("Store.applyPage", () => {
     store.close();
   });
 
-  test("synced status records syncedTs as a string (int64-safe)", async () => {
+  test("upToDate records its snapshotTs", async () => {
     const store = new Store(":memory:");
-    store.applyPage(page({ status: { type: "synced", syncedTs: 1234 } }));
-    const state = store.getState();
-    assert.equal(state.statusType, "synced");
-    assert.equal(state.syncedTs, "1234");
-    store.close();
-  });
-
-  test("upToDate status (live API vocabulary) records snapshotTs", async () => {
-    const store = new Store(":memory:");
-    store.applyPage(page({ status: { type: "upToDate", snapshotTs: 5678 } }));
+    store.applyPage(page({ status: { type: "upToDate", snapshotTs: 5678n } }));
     const state = store.getState();
     assert.equal(state.statusType, "upToDate");
     assert.equal(state.syncedTs, "5678");
+    store.close();
+  });
+
+  test("stale is a consistent snapshot at an older ts, so it records snapshotTs too", async () => {
+    const store = new Store(":memory:");
+    store.applyPage(page({ status: { type: "stale", snapshotTs: 4321n } }));
+    const state = store.getState();
+    assert.equal(state.statusType, "stale");
+    assert.equal(state.syncedTs, "4321");
+    store.close();
+  });
+
+  test("snapshotting has no consistent ts to record", async () => {
+    const store = new Store(":memory:");
+    store.applyPage(page({ status: { type: "snapshotting" } }));
+    assert.equal(store.getState().syncedTs, null);
+    store.close();
+  });
+
+  test("an int64 timestamp past 2^53 is stored exactly", async () => {
+    const store = new Store(":memory:");
+    store.applyPage(page({ status: { type: "upToDate", snapshotTs: 1789075524036369486n } }));
+    assert.equal(store.getState().syncedTs, "1789075524036369486");
     store.close();
   });
 
@@ -141,13 +155,13 @@ describe("Store.applyPage", () => {
     store.applyPage(
       page({
         values: [
-          { component: "", table: "users", deleted: false, ts: 10, value: doc("u1", { name: "a" }) },
+          { component: "", table: "users", deleted: false, ts: 10n, value: doc("u1", { name: "a" }) },
         ],
       }),
     );
     store.applyPage(
       page({
-        values: [{ component: "", table: "users", deleted: true, ts: 20, value: { _id: "u1" } }],
+        values: [{ component: "", table: "users", deleted: true, ts: 20n, value: { _id: "u1" } }],
       }),
     );
     assert.equal((await collect(store.readTable("", "users"))).length, 0);
@@ -165,9 +179,9 @@ describe("Store.applyPage", () => {
     store.applyPage(
       page({
         values: [
-          { component: "", table: "users", deleted: false, ts: 10, value: doc("u1") },
-          { component: "", table: "users", deleted: true, ts: 20, value: { _id: "u1" } },
-          { component: "", table: "users", deleted: false, ts: 30, value: doc("u1", { back: true }) },
+          { component: "", table: "users", deleted: false, ts: 10n, value: doc("u1") },
+          { component: "", table: "users", deleted: true, ts: 20n, value: { _id: "u1" } },
+          { component: "", table: "users", deleted: false, ts: 30n, value: doc("u1", { back: true }) },
         ],
       }),
     );
@@ -181,7 +195,7 @@ describe("Store.applyPage", () => {
     const store = new Store(":memory:", { keepDeleted: true });
     store.applyPage(
       page({
-        values: [{ component: "", table: "users", deleted: true, ts: 20, value: { _id: "ghost" } }],
+        values: [{ component: "", table: "users", deleted: true, ts: 20n, value: { _id: "ghost" } }],
       }),
     );
     const kept = (await collect(store.readTable("", "users", true)));
@@ -193,7 +207,7 @@ describe("Store.applyPage", () => {
     const store = new Store(":memory:");
     store.applyPage(
       page({
-        values: [{ component: "", table: "users", deleted: false, ts: 10, value: doc("u1") }],
+        values: [{ component: "", table: "users", deleted: false, ts: 10n, value: doc("u1") }],
       }),
     );
     store.reset();
@@ -206,7 +220,7 @@ describe("Store.applyPage", () => {
     const store = new Store(":memory:");
     store.applyPage(
       page({
-        values: [{ component: "", table: "users", deleted: false, ts: 10, value: doc("u1") }],
+        values: [{ component: "", table: "users", deleted: false, ts: 10n, value: doc("u1") }],
       }),
     );
     assert.throws(
@@ -215,8 +229,8 @@ describe("Store.applyPage", () => {
           page({
             pagination: { hasMore: true, nextCursor: "cursor-bad" },
             values: [
-              { component: "", table: "users", deleted: false, ts: 20, value: doc("u2") },
-              { component: "", table: "users", deleted: false, ts: 20, value: { name: "no id" } },
+              { component: "", table: "users", deleted: false, ts: 20n, value: doc("u2") },
+              { component: "", table: "users", deleted: false, ts: 20n, value: { name: "no id" } },
             ],
           }),
         ),

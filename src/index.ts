@@ -5,6 +5,7 @@ export {
   DataSyncClient,
   consistentTs,
   isCaughtUp,
+  parseJson,
   type ActiveDataSync,
   type DataSyncArgs,
   type DataSyncResponse,
@@ -37,17 +38,12 @@ export {
 export {
   ROOT_COMPONENT_ALIAS,
   buildSelection,
-  needsRootTables,
   parseColumnFilter,
   parseComponentFilter,
-  parseTableFilter,
-  tableMatches,
   type ColumnFilter,
   type ComponentFilter,
   type SelectionInput,
-  type TableFilter,
-} from "./filter.ts";
-export { runDryRun } from "./inspect.ts";
+} from "./selection.ts";
 export { writeParquetFile } from "./parquet.ts";
 export { Store } from "./store.ts";
 export { runSync, type SyncOptions } from "./sync.ts";

@@ -1,4 +1,4 @@
-// The contract sync, export, status and dry-run are written against, so the
+// The contract sync, export and status are written against, so the
 // synced data can live either in SQLite (random-access, the default) or in an
 // append-only log of parquet deltas.
 

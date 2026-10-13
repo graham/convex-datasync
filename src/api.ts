@@ -1,21 +1,34 @@
 // Client for the Convex deployment data sync API.
 // https://docs.convex.dev/deployment-api/data-sync
+//
+// Covers the three documented data endpoints, typed from the public OpenAPI
+// spec:
+//   POST /data/sync                 stream pages of changes
+//   GET  /data/list_active_syncs    progress of every active sync
+//   GET  /data/sync/{syncId}        progress of one sync
 
-export type InclusionDefault = "excl" | "incl";
+// The spec's names for the include/exclude flags. The deployment also accepts
+// the short forms `incl`/`excl`, but they are not documented.
+export type InclusionDefault = "included" | "excluded";
 
-// "excl" excludes the table entirely; otherwise a per-column selection where
-// `_other` is the default for unlisted columns. `_id` cannot be excluded.
-export type TableSelection = "excl" | { [columnOrOther: string]: InclusionDefault };
+// "excluded" drops the table entirely. Otherwise a per-column selection where
+// `_other` is the default for unlisted columns. `_id` cannot be excluded. A bare
+// "included" is not valid here: the schema only allows the object form.
+export type TableSelection = "excluded" | { _other: InclusionDefault; [column: string]: InclusionDefault };
 
-// "excl" excludes the component entirely; otherwise a per-table selection
-// where the required `_other` key is the default for unlisted tables.
+// "excluded" drops the component entirely. Otherwise a per-table selection
+// where `_other` is the default for unlisted tables. Same rule as tables: no
+// bare "included".
 export type ComponentSelection =
-  | "excl"
-  | { [tableOrOther: string]: TableSelection | InclusionDefault };
+  | "excluded"
+  | { _other: InclusionDefault; [table: string]: TableSelection | InclusionDefault };
 
 // Keys are component paths (the root component is the empty string), plus a
-// required `_other` key as the default for unlisted components.
-export type Selection = { [componentPathOrOther: string]: ComponentSelection | InclusionDefault };
+// required `_other` as the default for unlisted components.
+export type Selection = {
+  _other: InclusionDefault;
+  [componentPath: string]: ComponentSelection | InclusionDefault;
+};
 
 export interface DataSyncArgs {
   cursor?: string | null;
@@ -26,7 +39,8 @@ export interface DataSyncValue {
   component: string;
   table: string;
   deleted: boolean;
-  ts: number;
+  // int64 nanoseconds, which a JS number cannot hold exactly. See parseJson.
+  ts: bigint;
   // Document fields including _id and _creationTime. Deleted docs only have _id.
   value: Record<string, unknown>;
 }
@@ -36,41 +50,26 @@ export interface DataSyncTruncate {
   table: string;
 }
 
-// The live API (as of 2026-08) reports `snapshotting` while traversing and
-// `upToDate` (with `snapshotTs`) once caught up. A newer revision of the
-// OpenAPI spec names these `inProgress` and `synced` (with `syncedTs`); both
-// vocabularies are accepted since the endpoint is beta.
-// `stale` has also been observed from the live API between `snapshotting` and
-// `upToDate`: the initial traversal finished but the emitted data is not yet
-// consistent (the log replay is still catching up). Not a stop signal.
+// `snapshotting`: the traversal of the selected tables is still under way and
+//   what has been emitted is an incomplete snapshot.
+// `stale`: what has been emitted is a consistent snapshot, but at an older
+//   snapshotTs; newer changes are still to come.
+// `upToDate`: caught up to the latest consistent snapshot.
 export type DataSyncStatus =
   | { type: "snapshotting" }
-  | { type: "stale" }
-  | { type: "upToDate"; snapshotTs: number }
-  | { type: "inProgress" }
-  | { type: "synced"; syncedTs: number };
+  | { type: "stale"; snapshotTs: bigint }
+  | { type: "upToDate"; snapshotTs: bigint };
 
-// The timestamp at which the synced data is consistent, if caught up.
-export function consistentTs(status: DataSyncStatus): number | null {
-  if (status.type === "upToDate") {
-    return status.snapshotTs;
-  }
-  if (status.type === "synced") {
-    return status.syncedTs;
-  }
-  return null;
+// The timestamp at which the synced data is consistent, if the status has one.
+export function consistentTs(status: DataSyncStatus): bigint | null {
+  return status.type === "snapshotting" ? null : status.snapshotTs;
 }
 
-// Whether this page means the sync is caught up. `hasMore` alone is not a
-// stop signal: the live API returns `hasMore: true` even on `upToDate` pages
-// (it is an infinite streaming endpoint), so a one-shot sync must stop on the
-// status instead or it will poll forever.
+// A one-time sync is finished at the first `upToDate` page. Nothing else
+// signals the end: the endpoint is an infinite stream, so `hasMore` is always
+// true and `nextCursor` is always present.
 export function isCaughtUp(page: DataSyncResponse): boolean {
-  return (
-    page.status.type === "upToDate" ||
-    page.status.type === "synced" ||
-    !page.pagination.hasMore
-  );
+  return page.status.type === "upToDate";
 }
 
 export interface PaginationMetadata {
@@ -86,32 +85,39 @@ export interface DataSyncResponse {
   values: DataSyncValue[];
 }
 
-// Loosely typed for the same reason as DataSyncStatus: the live API uses
-// `snapshotting`/`upToDate`, the newer spec `inProgress`/`synced`, and the
-// fields present depend on the phase.
-export interface ActiveDataSyncStatus {
-  type: string;
-  currentComponent?: string;
-  currentTable?: string;
-  numDocumentsInCurrentTable?: number;
-  numDocumentsSynced?: number;
-  numTablesSynced?: number;
-  totalDocuments?: number;
-  totalDocumentsInCurrentTable?: number;
-  totalTables?: number;
-  snapshotTs?: number;
-  syncedTs?: number;
-}
+// The deployment's view of a sync, which names the consistent timestamp
+// `syncedTs` where the page itself says `snapshotTs`.
+export type ActiveDataSyncStatus =
+  | {
+      type: "snapshotting";
+      numTablesSynced: number;
+      totalTables: number;
+      currentComponent: string;
+      currentTable: string;
+      numDocumentsInCurrentTable: number;
+      totalDocumentsInCurrentTable: number;
+      numDocumentsSynced: number;
+      totalDocuments: number;
+    }
+  | { type: "stale"; totalTables: number; numDocumentsSynced: number; syncedTs: bigint }
+  | { type: "upToDate"; totalTables: number; numDocumentsSynced: number; syncedTs: bigint };
 
 export interface ActiveDataSync {
-  lastUpdated: number;
   syncId: string;
+  // Unix milliseconds of the last /data/sync call this sync made.
+  lastUpdated: number;
   status: ActiveDataSyncStatus;
 }
 
 export interface ListActiveSyncsResponse {
   pagination: PaginationMetadata;
   syncs: ActiveDataSync[];
+}
+
+export interface ListActiveSyncsOptions {
+  // 1 to 100; the deployment rejects anything else and defaults to 50.
+  limit?: number;
+  cursor?: string | null;
 }
 
 export class ApiError extends Error {
@@ -125,13 +131,64 @@ export class ApiError extends Error {
     this.code = code;
   }
 
+  // A sync stays active for 3 days after its last page. Past that the cursor
+  // is refused. This code is not in the public docs; it is what the deployment
+  // is observed to answer.
   get cursorExpired(): boolean {
     return this.status === 400 && this.code === "DataSyncCursorExpired";
+  }
+
+  // The cursor could not be parsed at all, e.g. a corrupted cursor file.
+  get cursorInvalid(): boolean {
+    return this.status === 400 && this.code === "InvalidDataSyncCursor";
   }
 
   get retryable(): boolean {
     return this.status === 429 || this.status >= 500;
   }
+}
+
+// Fields the spec types as int64 that can exceed 2^53 and so lose digits
+// through a plain JSON.parse. Only these are kept exact; document contents are
+// left as parsed.
+const INT64_KEYS = new Set(["ts", "snapshotTs", "syncedTs"]);
+
+function isInt64Holder(key: string, holder: Record<string, unknown>): boolean {
+  // Documents always carry _id and the envelope objects never do, so a holder
+  // with _id is user data and is never touched.
+  if ("_id" in holder) {
+    return false;
+  }
+  if (key === "ts") {
+    return "component" in holder && "table" in holder && "deleted" in holder;
+  }
+  return typeof holder.type === "string";
+}
+
+type ReviverContext = { source?: string } | undefined;
+
+// JSON.parse that keeps the spec's int64 fields exact as bigint. The source
+// text of a number is available to the reviver, so no custom parser is needed.
+export function parseJson(text: string): unknown {
+  const reviver = function (
+    this: Record<string, unknown>,
+    key: string,
+    value: unknown,
+    context?: ReviverContext,
+  ): unknown {
+    const source = context?.source;
+    if (
+      INT64_KEYS.has(key) &&
+      typeof value === "number" &&
+      source !== undefined &&
+      /^-?\d+$/.test(source) &&
+      isInt64Holder(key, this)
+    ) {
+      return BigInt(source);
+    }
+    return value;
+  };
+  return JSON.parse(text, reviver as unknown as Parameters<typeof JSON.parse>[1]);
 }
 
 const MAX_RETRIES = 5;
@@ -148,9 +205,13 @@ export class DataSyncClient {
     this.authHeader = `Convex ${deployKey}`;
   }
 
-  // Runs a system UDF (e.g. _system/cli/tables) via the deployment's query
-  // endpoint. These power the dashboard/CLI and require the admin key.
-  async systemQuery<T>(path: string, args: Record<string, unknown>): Promise<T> {
+  // NOT part of the documented data sync API. The data sync endpoints take
+  // tables by name and have no way to list or count them, so the pattern-based
+  // table filters (--include-tables / --exclude-tables) and `dry-run` ask the
+  // deployment through the admin system queries the Convex CLI and dashboard
+  // use. Everything else in this class is documented; keep these confined to
+  // those features so they are all that depends on them.
+  private async systemQuery<T>(path: string, args: Record<string, unknown>): Promise<T> {
     const response = await fetch(this.deploymentUrl + "/api/query", {
       method: "POST",
       headers: {
@@ -171,7 +232,16 @@ export class DataSyncClient {
     return result.value;
   }
 
-  // Names of the root component's tables (excluding system tables).
+  // Number of documents currently in a root-component table. Also an
+  // undocumented admin query (the one behind the dashboard's table counts),
+  // used only by `dry-run`.
+  async tableSize(tableName: string): Promise<number> {
+    return this.systemQuery<number>("_system/frontend/tableSize", { tableName });
+  }
+
+  // Names of the root component's tables (excluding system tables). See
+  // systemQuery: undocumented, used only by the regex table filters and
+  // `dry-run`.
   async listRootTables(): Promise<string[]> {
     const names: string[] = [];
     let cursor: string | null = null;
@@ -188,13 +258,17 @@ export class DataSyncClient {
     }
   }
 
-  // Number of documents currently in a root-component table.
-  async tableSize(tableName: string): Promise<number> {
-    return this.systemQuery<number>("_system/frontend/tableSize", { tableName });
-  }
-
+  // Omits the cursor on the first call and the selection when nothing is
+  // restricted, as the docs describe, rather than sending explicit nulls.
   async fetchPage(args: DataSyncArgs, signal?: AbortSignal): Promise<DataSyncResponse> {
-    return this.request<DataSyncResponse>("POST", "/data/sync", args, signal);
+    const body: DataSyncArgs = {};
+    if (args.cursor) {
+      body.cursor = args.cursor;
+    }
+    if (args.selection !== undefined) {
+      body.selection = args.selection;
+    }
+    return this.request<DataSyncResponse>("POST", "/data/sync", body, signal);
   }
 
   // Server-side progress of one sync, or null when the deployment does not
@@ -209,7 +283,6 @@ export class DataSyncClient {
         signal,
       );
     } catch (error) {
-      // 404 DataSyncNotFound: unknown id, or one that went inactive.
       if (error instanceof ApiError && error.status === 404) {
         return null;
       }
@@ -217,15 +290,33 @@ export class DataSyncClient {
     }
   }
 
-  // Follows pagination (the endpoint returns pages of syncs, most recently
-  // updated first) and returns the combined list.
+  // One page of active syncs, most recently updated first.
+  async listActiveSyncsPage(
+    options: ListActiveSyncsOptions = {},
+    signal?: AbortSignal,
+  ): Promise<ListActiveSyncsResponse> {
+    const query = new URLSearchParams();
+    if (options.limit !== undefined) {
+      query.set("limit", String(options.limit));
+    }
+    if (options.cursor) {
+      query.set("cursor", options.cursor);
+    }
+    const suffix = query.size > 0 ? `?${query}` : "";
+    return this.request<ListActiveSyncsResponse>(
+      "GET",
+      `/data/list_active_syncs${suffix}`,
+      undefined,
+      signal,
+    );
+  }
+
+  // Follows pagination to the end and returns every active sync.
   async listActiveSyncs(signal?: AbortSignal): Promise<ListActiveSyncsResponse> {
     const syncs: ActiveDataSync[] = [];
     let cursor: string | null = null;
     while (true) {
-      const path: string =
-        "/data/list_active_syncs" + (cursor ? `?cursor=${encodeURIComponent(cursor)}` : "");
-      const page = await this.request<ListActiveSyncsResponse>("GET", path, undefined, signal);
+      const page: ListActiveSyncsResponse = await this.listActiveSyncsPage({ cursor }, signal);
       syncs.push(...page.syncs);
       cursor = page.pagination.nextCursor ?? null;
       if (!page.pagination.hasMore || cursor === null) {
@@ -266,7 +357,7 @@ export class DataSyncClient {
         continue;
       }
       if (response.ok) {
-        return (await response.json()) as T;
+        return parseJson(await response.text()) as T;
       }
       const error = await toApiError(response);
       if (!error.retryable) {

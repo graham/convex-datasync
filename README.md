@@ -46,7 +46,7 @@ for await (const doc of store.readTable("", "users")) {
 store.close();
 ```
 
-`Store` (sqlite) and `DeltaLogStore` (parquet deltas) both implement the `DataStore` interface that `runSync`, `runExport` and `runDryRun` take, so they are interchangeable. Reads are async on both: `tableStats()` returns a promise and `readTable()` is an async iterable, since the parquet backend has to decode files to answer them.
+`Store` (sqlite) and `DeltaLogStore` (parquet deltas) both implement the `DataStore` interface that `runSync` and `runExport` take, so they are interchangeable. Reads are async on both: `tableStats()` returns a promise and `readTable()` is an async iterable, since the parquet backend has to decode files to answer them.
 
 The published entry points are compiled JS in `dist/` (built by the `prepare` script on install), so consumers just need node >= 24. To publish to the npm registry, remove `"private": true` and run `npm publish`.
 
@@ -63,8 +63,10 @@ datasync sync --deployment brave-cat-123
 # Keep polling for new writes (default every 60s once caught up).
 datasync sync --watch --interval 30
 
-# See which tables have new data without downloading anything.
+# See what a sync would cover, and how far behind the local copy is,
+# without downloading anything.
 datasync dry-run
+datasync dry-run --exclude-tables="^auth" --exclude-columns games:description
 
 # Only sync specific root-component tables, exactly or by regex.
 datasync sync --tables users,posts
@@ -73,7 +75,7 @@ datasync sync --include-tables="^youtube"
 
 # Narrow further: leave columns on the server, or skip whole components.
 datasync sync --exclude-columns youtubeVideos:description
-datasync sync --include-columns title,score
+datasync sync --tables games --include-columns title,score
 datasync sync --exclude-components videosPerGamePerDay
 
 # Keep rows for deleted documents (deleted flag set, last value preserved)
@@ -94,6 +96,10 @@ datasync status --remote
 # Live data syncs on the deployment (server-side view, via
 # /data/list_active_syncs); the one this database follows is marked.
 datasync list
+datasync list --limit 5
+
+# The command reference.
+datasync help
 
 # Dump synced tables to export/<component>/<table>.jsonl.
 datasync export
@@ -120,7 +126,7 @@ Fetches pages from `/data/sync` until the deployment reports the sync is caught 
 
 - Connection: `--url <url>`, `--deploy-key <key>` (default from env), `--prod` (the current project's prod deployment), `--deployment <name>` (any deployment, bare or `prod:`-prefixed). `--prod`/`--deployment` take precedence over env credentials and require an `npx convex login` session.
 - Storage: `--store sqlite` (default) with `--db <path>` (default `<deployment-name>.sqlite3`), or `--store log` with `--log-dir <dir>` (default `<deployment-name>.deltalog`); see [Parquet all the way down](#parquet-all-the-way-down---store-log).
-- Table selection: `--tables <a,b,c>` (exact list), or `--include-tables <regex>` / `--exclude-tables <regex>` (`--ignore-tables` is an alias for exclude). The exact list cannot be combined with the regex flags. Filters apply to root-component tables.
+- Table selection: `--tables <a,b,c>` (exact list), or `--include-tables <regex>` / `--exclude-tables <regex>` (`--ignore-tables` is an alias for exclude). The exact list cannot be combined with the regex flags. Filters apply to root-component tables. See [Selecting tables, columns and components](#selecting-tables-columns-and-components) for the one undocumented call the regex flags make.
 - Column selection: `--exclude-columns <spec>` or `--include-columns <spec>`; see [Selecting columns and components](#selecting-columns-and-components).
 - Component selection: `--components <a,b,c>` / `--exclude-components <a,b,c>`, same section.
 - Output: `--format jsonl|json|csv|parquet` plus `--out <dir>` (default `export`) to also keep files in that format up to date; see [Syncing straight to files](#syncing-straight-to-files). Omit `--format` and sync writes only the sqlite mirror.
@@ -128,17 +134,38 @@ Fetches pages from `/data/sync` until the deployment reports the sync is caught 
 
 ### dry-run
 
-Compares server per-table document counts against the local copy and reports which tables differ — downloads no documents. Accepts the connection, `--store`/`--db`/`--log-dir`, and the exact/regex table flags. Root-component tables only; component tables are listed but not comparable.
+Shows the scope of a sync and how far the local copy is from the deployment, downloading and writing nothing. It takes the connection flags, `--store`/`--db`/`--log-dir`, and the same selection flags as `sync` (`--tables`, the table patterns, `--components`, `--exclude-components`, `--include-columns`, `--exclude-columns`), so you can try a selection before running it:
+
+```
+scope:
+  root tables:  3 of 28, 12947 document(s)
+  skipped:      25 table(s): aggregateRows, authAccounts, ... and 17 more
+  components:   all (their tables cannot be counted, only synced)
+  columns:      dropping games:blob
+
+table                     server    local    delta
+featureRequests                3        0       +3  not synced yet
+games                      12942        0   +12942  not synced yet
+users                          2        0       +2  not synced yet
+```
+
+- The scope block is the part to read before a first backup: how many root tables and documents the flags select, what they skip, and which components and columns are in or out. Components other than the root cannot be counted, only listed.
+- The table compares the deployment's document count per table with the local copy: `delta` is what a sync would bring in (or remove). A table the flags skip appears only if the local copy still holds documents from it. Counts cannot detect in-place updates, so a table can match and still have changed documents; sync is the source of truth.
+- It refuses what `sync` would refuse, for example a `table:column` entry for a table the pattern drops, before reporting anything.
+- It never creates the local copy: before a first sync every table simply reads as not synced yet.
+- **It uses two admin queries outside the documented API**, the table list and the per-table document count (`_system/cli/tables` and `_system/frontend/tableSize` on `/api/query`). Nothing documented offers either. They are confined to `dry-run` and the table patterns, so a sync that names its tables with `--tables` never depends on them.
 
 ### status
 
 Offline: prints the saved syncId, status, consistency timestamp, and per-table counts (with deleted counts when `--keep-deleted` was used) from the local copy. Accepts `--store`/`--db`/`--log-dir`, `--url`, `--deployment` for locating it. `--prod` alone is rejected here (the prod deployment's name — and so its db file — requires a network call): pass `--deployment <name>` or `--db`.
 
-`--remote` additionally asks the deployment for its own view of this sync, via `GET /data/sync/:sync_id`: phase, documents synced against the total, the table it is walking, and when it last served a page. A sync goes inactive three days after its last page, and `--remote` says so explicitly rather than leaving you to discover it as a dead cursor on the next run.
+`--remote` additionally asks the deployment for its own view of this sync, via `GET /data/sync/{syncId}`, and when it last served a page. While the sync is still traversing, that is the phase, tables and documents synced against the totals, and the table it is on. Once it has a consistent snapshot it is the table and document counts and the timestamp the data is consistent at. A sync stays active for three days after its last page, and `--remote` says so explicitly when the deployment has forgotten it, rather than leaving you to discover it as a refused cursor on the next run.
 
 ### list (alias: active-syncs)
 
 Lists the deployment's live data syncs via `/data/list_active_syncs` (anything that fetched a page in the past 3 days), most recently updated first, following pagination. The sync your local database follows is marked `<- this database`. Accepts the connection flags. To look at just your own sync, `status --remote` fetches it by id instead of listing every one.
+
+`--limit <n>` (1 to 100) passes the endpoint's `limit` parameter and returns that one page, noting when more exist. The deployment answers 400 outside that range, so the flag is validated before any request is made, even though the docs describe larger values as capped.
 
 ### export
 
@@ -226,7 +253,7 @@ select * exclude (_op, _seq, rn) from (
 
 `union_by_name = true` is load-bearing: deltas deliberately have different column sets. The `_op = 't'` clause discards everything up to the last truncate — truncates are written with a lower `_seq` than the values in their own page, so a table truncated and refilled in one page folds correctly.
 
-`status`, `export` and `dry-run` do this fold internally, so they work the same as with sqlite. Folding 3,001 delta files into 110k live documents takes ~1.2s in-process, or ~244ms in DuckDB.
+`status` and `export` do this fold internally, so they work the same as with sqlite. Folding 3,001 delta files into 110k live documents takes ~1.2s in-process, or ~244ms in DuckDB.
 
 ### Trade-offs
 
@@ -235,33 +262,41 @@ select * exclude (_op, _seq, rn) from (
 - **Consumers must fold.** A delta file on its own is not the table — `games/000000000004.parquet` holds a page of changes, not the current data. Point tools at `fold.sql`, not at individual files.
 - **sqlite remains the default** and is still the better choice if you want a queryable local mirror or the fastest possible reads.
 
-`--format` is rejected on the commands it would not affect (`status`, `list`, `dry-run`) rather than being silently ignored.
+`--format` is rejected on the commands it would not affect (`dry-run`, `status`, `list`) rather than being silently ignored.
 
-## Selecting columns and components
+## Selecting tables, columns and components
 
-The sync selection reaches three levels: components, their tables, and those tables' columns. Table and column flags apply to root-component tables, matching how the regex filters have always worked; component flags select whole components.
+The data sync API's `selection` argument reaches three levels: components, the tables in them, and the columns of those tables. Table and column flags address root-component tables; component flags address whole components.
 
 ```sh
 # Leave a heavy field on the server. The rest of the document still syncs.
 datasync sync --exclude-columns youtubeVideos:description
 
-# Same field name dropped from every table.
-datasync sync --exclude-columns description
+# Table patterns, resolved against the deployment's table list.
+datasync sync --exclude-tables="^auth"
+datasync sync --include-tables="^youtube" --exclude-columns description
 
-# Keep only these columns. _id always comes through; everything else,
-# _creationTime included, is left behind.
-datasync sync --include-columns title,score
+# Keep only these columns of one table. _id always comes through; everything
+# else, _creationTime included, is left behind.
+datasync sync --include-columns games:title,games:score
+
+# A bare column name applies to every table named by --tables.
+datasync sync --tables games,users --exclude-columns description
 
 # Components, named by path. _root names the root component.
 datasync sync --exclude-components videosPerGamePerDay
 datasync sync --components _root,waitlist
 ```
 
-- A column spec is a comma-separated list of `column` (applies to every root table) or `table:column` (that table only). `--include-columns` and `--exclude-columns` cannot be combined.
-- `_id` cannot be excluded — the store keys documents by it — and `--exclude-columns _id` is rejected rather than quietly ignored.
-- Under `--include-columns`, a table that no entry names keeps all of its columns. So `--include-columns games:title` narrows `games` and leaves every other table whole.
-- Column filters need the deployment's table list, since each affected table has to be named in the selection. That costs one extra call unless `--tables` already supplies the names.
-- Dropping a column stops it being transferred at all, so it also shrinks what the deployment reads. Columns removed from the selection between runs leave whatever was already synced in the local copy; use `--fresh` for a clean slate.
+- A column spec is a comma-separated list of `table:column` entries, or of bare `column` names when `--tables` or a table regex says which tables they apply to. A bare name with neither is rejected: the schema can only attach a column selection to a table that is named, and nothing else names the tables. `--include-columns` and `--exclude-columns` cannot be combined.
+- `_id` cannot be excluded — the deployment refuses it, and the store keys documents by it — so `--exclude-columns games:_id` is rejected rather than quietly ignored.
+- **The regex flags make one call outside the documented API.** The data sync endpoints take tables by name and cannot list them, so `--include-tables` and `--exclude-tables` ask the deployment for its table names through the admin query the Convex CLI uses (`_system/cli/tables` on `/api/query`). `dry-run` adds a second such query for document counts. Everything else in this tool uses the three documented endpoints. If those queries ever change, only the table patterns and `dry-run` are affected; `--tables` and `table:column` need no listing and keep working.
+- A table that no column entry names keeps all of its columns, so `--include-columns games:title` narrows `games` and leaves every other table whole.
+- Column entries for a table that the table selection does not include are an error rather than a silent no-op: `--tables games --exclude-columns users:email` is rejected.
+- Dropping a column stops it being transferred at all, so it also shrinks what the deployment reads.
+- The selection may change between runs of the same sync. Tables you newly select are synced from scratch, and the deployment emits a truncate for each so the local copy starts them clean; it may also move the sync back to `snapshotting`. Tables you deselect simply stop being synced: what was already stored for them stays in the local copy, as do columns you stop selecting. Use `--fresh` for a clean slate.
+
+The request is sent in the API's documented vocabulary, `included` / `excluded`. A component or table that is included is written as an object (`{ "_other": "included" }`); only `excluded` may stand alone as a string, and the deployment rejects a bare `"included"` with a 400.
 
 ## Output
 
@@ -274,12 +309,10 @@ Ctrl-c is always safe. Every page is applied to SQLite in one transaction togeth
 ## How incremental sync works
 
 - The API streams pages of document upserts and tombstones, plus table truncations, with an opaque `nextCursor` per page.
-- Pages are fetched until the page status reports the sync is caught up (`upToDate` on the live API, `synced` in the newer spec). `hasMore` alone is not a stop signal: the live endpoint keeps returning `hasMore: true` forever, since it is an infinite stream. With `--watch` the tool sleeps between caught-up pages and keeps polling instead of exiting.
-- The cursor is stored in the SQLite database next to the data. The next run resumes from it.
-- A cursor expires if unused for 3 days. When that happens the tool exits with instructions to rerun with `--fresh`.
-- Deselecting a table between runs (via `--tables` or the regex filters) stops exporting it, but documents already synced from it stay in the local database; use `--fresh` if you want a clean slate.
-- Convex timestamps are int64 nanoseconds, which exceed what a JS number holds exactly, so the `syncedTs` shown by `status` and the sync summary can differ from the deployment's value in the last couple of digits. It is display only — nothing keys off it.
-- `dry-run` compares per-table document counts (the same numbers the dashboard shows) between the server and the local copy. It downloads no documents. Counts cannot detect in-place updates, and the regex filters only apply to root-component tables; component tables are listed but not compared.
+- Pages are fetched until the first page whose status is `upToDate`, which is how the docs say a one-time sync ends. The endpoint is an infinite stream — `hasMore` is always `true` and there is always a `nextCursor` — so neither says anything about progress; only the status does. `snapshotting` means the traversal is still under way. `stale` is a consistent snapshot at an older timestamp with newer changes still to come, so the tool keeps going through it. With `--watch` the tool sleeps between `upToDate` pages, as the docs recommend, and keeps polling instead of exiting. If a selection change or a bulk operation sends the sync back to `snapshotting`, pages are fetched without sleeping until it is caught up again.
+- The cursor is stored next to the data (in the SQLite database, or `cursor.json` for `--store log`). The next run resumes from it.
+- A sync stays active for 3 days after its last page. Past that the deployment refuses its cursor, and the tool exits with instructions to rerun with `--fresh`; so does a cursor it cannot parse. `status --remote` shows whether the deployment still knows the sync before you get that far.
+- Timestamps in the API (`ts`, `snapshotTs`, `syncedTs`) are int64 nanoseconds, more than a JS number holds exactly. They are read as `bigint` and stored as exact decimal strings, so what `status` prints matches what the deployment reports to the last digit.
 
 ## Development
 
@@ -289,4 +322,4 @@ npm run typecheck    # tsc --noEmit
 npm run build        # emit dist/
 ```
 
-The source runs directly under node's native TypeScript support (`node src/cli.ts ...`); `dist/` is only needed for the installed bin and library entry points. `--keep-deleted` details: tombstones from the API carry only `_id`, so the row's `value` column keeps the last-synced document; `readTable(component, table, true)` includes tombstoned rows, and exports/dry-run counts cover live documents only.
+The source runs directly under node's native TypeScript support (`node src/cli.ts ...`); `dist/` is only needed for the installed bin and library entry points. `--keep-deleted` details: tombstones from the API carry only `_id`, so the row's `value` column keeps the last-synced document; `readTable(component, table, true)` includes tombstoned rows, and exports and counts cover live documents only.

@@ -16,8 +16,8 @@ const outDir = (): string => join(root, `out${counter++}`);
 
 function page(values: DataSyncResponse["values"]): DataSyncResponse {
   return {
-    pagination: { hasMore: false, nextCursor: "c" },
-    status: { type: "synced", syncedTs: 1 },
+    pagination: { hasMore: true, nextCursor: "c" },
+    status: { type: "upToDate", snapshotTs: 1n },
     syncId: "s",
     truncates: [],
     values,
@@ -35,7 +35,7 @@ function storeWith(
         component: d.component ?? "",
         table: d.table,
         deleted: false,
-        ts: 1,
+        ts: 1n,
         value: d.value,
       })),
     ),
@@ -117,9 +117,9 @@ describe("runExport", () => {
     const store = new Store(":memory:", { keepDeleted: true });
     store.applyPage(
       page([
-        { component: "", table: "users", deleted: false, ts: 1, value: { _id: "u1", n: 1 } },
-        { component: "", table: "users", deleted: false, ts: 1, value: { _id: "u2", n: 2 } },
-        { component: "", table: "users", deleted: true, ts: 2, value: { _id: "u2" } },
+        { component: "", table: "users", deleted: false, ts: 1n, value: { _id: "u1", n: 1 } },
+        { component: "", table: "users", deleted: false, ts: 1n, value: { _id: "u2", n: 2 } },
+        { component: "", table: "users", deleted: true, ts: 2n, value: { _id: "u2" } },
       ]),
     );
     const csvDir = await exportTo(store, "csv");
@@ -134,7 +134,7 @@ describe("runExport", () => {
   test("a table holding only tombstones exports an empty file, not a crash", async () => {
     const store = new Store(":memory:", { keepDeleted: true });
     store.applyPage(
-      page([{ component: "", table: "users", deleted: true, ts: 1, value: { _id: "ghost" } }]),
+      page([{ component: "", table: "users", deleted: true, ts: 1n, value: { _id: "ghost" } }]),
     );
     const csvDir = await exportTo(store, "csv");
     assert.equal(readFileSync(join(csvDir, "users.csv"), "utf8"), "");

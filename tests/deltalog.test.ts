@@ -18,7 +18,7 @@ const logDir = (): string => join(root, `log${counter++}`);
 function page(overrides: Partial<DataSyncResponse>): DataSyncResponse {
   return {
     pagination: { hasMore: true, nextCursor: "cursor-1" },
-    status: { type: "inProgress" },
+    status: { type: "snapshotting" },
     syncId: "sync-1",
     truncates: [],
     values: [],
@@ -26,11 +26,11 @@ function page(overrides: Partial<DataSyncResponse>): DataSyncResponse {
   };
 }
 
-function upsert(table: string, value: Record<string, unknown>, ts = 10, component = "") {
+function upsert(table: string, value: Record<string, unknown>, ts = 10n, component = "") {
   return { component, table, deleted: false, ts, value };
 }
 
-function remove(table: string, id: string, ts = 20, component = "") {
+function remove(table: string, id: string, ts = 20n, component = "") {
   return { component, table, deleted: true, ts, value: { _id: id } };
 }
 
@@ -131,7 +131,7 @@ describe("DeltaLogStore", () => {
     store.applyPage(
       page({
         truncates: [{ component: "", table: "users" }],
-        values: [upsert("users", { _id: "u3" }, 30)],
+        values: [upsert("users", { _id: "u3" }, 30n)],
       }),
     );
     assert.deepEqual(ids(await collect(store.readTable("", "users"))), ["u3"]);
@@ -142,7 +142,7 @@ describe("DeltaLogStore", () => {
     const store = new DeltaLogStore(logDir());
     store.applyPage(
       page({
-        values: [upsert("users", { _id: "u1" }), upsert("users", { _id: "w1" }, 10, "waitlist")],
+        values: [upsert("users", { _id: "u1" }), upsert("users", { _id: "w1" }, 10n, "waitlist")],
       }),
     );
     store.applyPage(page({ truncates: [{ component: "waitlist", table: "users" }] }));
@@ -155,7 +155,7 @@ describe("DeltaLogStore", () => {
     const dir = logDir();
     const store = new DeltaLogStore(dir);
     store.applyPage(
-      page({ status: { type: "synced", syncedTs: 1234 }, values: [upsert("users", { _id: "u1" })] }),
+      page({ status: { type: "upToDate", snapshotTs: 1234n }, values: [upsert("users", { _id: "u1" })] }),
     );
     store.close();
 
@@ -164,7 +164,7 @@ describe("DeltaLogStore", () => {
     assert.equal(state.cursor, "cursor-1");
     assert.equal(state.syncId, "sync-1");
     assert.equal(state.syncedTs, "1234");
-    assert.equal(state.statusType, "synced");
+    assert.equal(state.statusType, "upToDate");
     assert.deepEqual(ids(await collect(reopened.readTable("", "users"))), ["u1"]);
     reopened.close();
   });
@@ -185,7 +185,7 @@ describe("DeltaLogStore", () => {
   test("component tables are stored under their component path", async () => {
     const dir = logDir();
     const store = new DeltaLogStore(dir);
-    store.applyPage(page({ values: [upsert("users", { _id: "w1" }, 10, "waitlist/inner")] }));
+    store.applyPage(page({ values: [upsert("users", { _id: "w1" }, 10n, "waitlist/inner")] }));
     assert.ok(existsSync(join(dir, "waitlist", "inner", "users")));
     assert.deepEqual(await store.tableStats(), [
       { component: "waitlist/inner", table: "users", documents: 1, deletedDocuments: 0 },
